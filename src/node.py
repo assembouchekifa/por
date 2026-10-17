@@ -8,9 +8,11 @@ Members from the design:
 
 A node registers itself on the directory authorities server (``data``
 keepalive), accepts circuits and peels one RSA layer per hop.  Every node
-just forwards the rest to the next hop; the **exit** node (last hop) is the
-only one that learns the destination address and the sender's ``reply_to``,
-so it is the only one able to deliver the message and return the answer.
+only knows the hop it received a packet from and the hop it forwards to.
+The **exit** node (last hop) is the only one that meets the destination;
+it sends the answer back to the previous hop, and each node on the way
+adds one more encryption layer for the original sender.  Nothing knows the
+sender's address.
 """
 
 import json
@@ -128,12 +130,15 @@ class Node:
                     if inner.get("final"):
                         print(f"[node {self.node_id}] packet arrived: final layer "
                               f"(exit) -> deliver to {inner['next']}", flush=True)
-                        self.exit_and_return(inner)
+                        self.exit_and_return(inner, sock, peer_id)
                     else:
                         print(f"[node {self.node_id}] packet arrived: peeled 1 RSA "
                               f"layer -> next hop {inner['next']}", flush=True)
                         # not the exit: we only see the next hop, nothing else
-                        self.send_message(inner["next"], protocol.unb64(inner["payload"]))
+                        reply = self.send_message(inner["next"],
+                                                  protocol.unb64(inner["payload"]))
+                        self._send_reply_back(sock, reply["payload"],
+                                              inner.get("reply_pub"), peer_id)
                 elif kind == "ping":
                     protocol.send_msg(sock, {"type": "pong", "id": self.node_id})
                 elif kind == "close":
@@ -190,17 +195,30 @@ class Node:
         plain = self.rsa.decrypt_message(payload)
         return json.loads(plain.decode())
 
-    def send_message(self, next_id: str, payload: bytes) -> None:
-        """Forward ``payload`` (still encrypted for the next hop)."""
-        sock = self._link_to(next_id)
-        protocol.send_msg(sock, {"type": "forward", "from": self.node_id,
-                                 "payload": protocol.b64(payload)})
+    def send_message(self, next_id: str, payload: bytes) -> dict:
+        """Forward ``payload`` to the next hop and wait for the reply back.
 
-    def exit_and_return(self, envelope: dict) -> bool:
-        """Exit-node role: deliver the message, then carry the reply back.
+        A fresh link is opened per forward so a circuit's reply always comes
+        back on the connection this node is watching.  Only this node's
+        neighbour is involved; nothing else about the path is known here.
+        """
+        sock = self._open_link(next_id)
+        try:
+            protocol.send_msg(sock, {"type": "forward", "from": self.node_id,
+                                     "payload": protocol.b64(payload)})
+            reply = protocol.recv_msg(sock)
+        finally:
+            sock.close()
+        if reply.get("type") != "reply":
+            raise protocol.ProtocolError(
+                f"expected reply from next hop {next_id!r}, got {reply.get('type')!r}")
+        return reply
 
-        Only this node sees ``reply_to`` (it was sealed in the innermost
-        layer), so only this node knows how to reach the sender again.
+    def exit_and_return(self, envelope: dict, back_sock, prev_hop: str) -> bool:
+        """Exit-node role: deliver the message, then send the reply back.
+
+        We only know the previous hop, so the reply simply goes back there
+        with one encryption layer for the original sender on top.
         """
         dest_host, dest_port = protocol.parse_addr(envelope["next"])
         text = protocol.unb64(envelope["payload"]).decode()
@@ -214,23 +232,22 @@ class Node:
         print(f"[node {self.node_id}] exit delivered {text!r} to "
               f"{dest_host}:{dest_port}, got {reply_text!r} back", flush=True)
 
-        reply_to = envelope.get("reply_to")
-        if not reply_to:
-            return True  # sender did not ask for a reply
-
-        back_host, back_port = protocol.parse_addr(reply_to)
-        with socket.create_connection((back_host, back_port)) as back:
-            protocol.send_msg(back, {"type": "deliver", "text": reply_text})
-        print(f"[node {self.node_id}] returned reply to {reply_to}", flush=True)
+        self._send_reply_back(back_sock, protocol.b64(reply_text.encode()),
+                              envelope.get("reply_pub"), prev_hop)
         return True
 
     # -- helpers --------------------------------------------------------
-    def _link_to(self, next_id: str) -> socket.socket:
-        with self._lock:
-            sock = self.links.get(next_id)
-        if sock is not None:
-            return sock
+    def _send_reply_back(self, back_sock, payload_b64: str, reply_pub,
+                         prev_hop: str) -> None:
+        """Add one layer with the sender's public key and hand it backwards."""
+        blob = protocol.unb64(payload_b64)
+        if reply_pub:
+            blob = self.rsa.encrypt_message(blob, self.rsa.import_public(reply_pub))
+        protocol.send_msg(back_sock, {"type": "reply", "payload": protocol.b64(blob)})
+        print(f"[node {self.node_id}] reply layer added -> "
+              f"back to previous hop {prev_hop}", flush=True)
 
+    def _open_link(self, next_id: str) -> socket.socket:
         entry = self.get_client(next_id)
         if entry is None:
             raise ConnectionError(f"unknown next hop {next_id!r} (not in directory)")
@@ -238,6 +255,4 @@ class Node:
               f"({entry['host']}:{entry['port']})", flush=True)
         sock = socket.create_connection((entry["host"], entry["port"]))
         protocol.handshake(sock, self.rsa, self.node_id)
-        with self._lock:
-            self.links[next_id] = sock
         return sock

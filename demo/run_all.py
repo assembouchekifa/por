@@ -85,7 +85,7 @@ def main() -> None:
         procs.append(sender)
         sender.wait(timeout=60)
 
-        print("\n=== done: server B replied, only the exit node knew the way back ===",
+        print("\n=== done: reply came back through every hop, A stripped all layers ===",
               flush=True)
         time.sleep(0.5)
     finally:

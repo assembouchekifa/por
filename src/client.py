@@ -9,10 +9,10 @@ Two personalities live in this class:
   authorities, calculates a circuit (:meth:`calc_path`) and pushes an
   onion-encrypted message into it.
 
-Only the *exit* node ever learns the sender's ``reply_to`` address: it
-sits inside the innermost RSA layer, so no intermediate hop (and not the
-destination itself) can see it.  That is why only the exit node is able to
-return the reply to client A.
+The reply does not need an address: it rides the circuit back.  Each node
+adds one encryption layer with the sender's public key as it hands the
+reply to the previous hop, and the sender strips them all at the end.
+Every node only ever knows the hop before it and the hop after it.
 """
 
 import json
@@ -124,39 +124,55 @@ class Client:
             self._hop_socks[entry["id"]] = sock
         return self.node_path
 
-    def send_message(self, text: str, target_addr: str, reply_to: str = None) -> None:
+    def send_message(self, text: str, target_addr: str) -> None:
         """Onion-encrypt ``text`` for ``target_addr`` (the destination server).
 
-        ``reply_to`` is our own ``ip:port``; it is sealed inside the layer
-        only the exit node can open.
+        Every layer also carries our public key (``reply_pub``) so each node
+        on the way back can add its own encryption for us.  The reply rides
+        the circuit back, so no address of ours ever leaves this machine.
         """
         if not self.node_path:
             raise RuntimeError("call init_connecting() before send_message()")
 
+        reply_pub = self.rsa.export_public()
+
         # innermost layer: everything the exit node needs, nobody else
-        envelope = {"next": target_addr, "final": True,
+        envelope = {"next": target_addr, "final": True, "reply_pub": reply_pub,
                     "payload": protocol.b64(text.encode())}
-        if reply_to:
-            envelope["reply_to"] = reply_to
 
         # wrap one RSA layer per hop, exit first (encdata1L, then encdat2L, ...)
         for entry in reversed(self.node_path):
             blob = self.rsa.encrypt_message(json.dumps(envelope).encode(),
                                             self.rsa_of_nodes[entry["id"]])
-            envelope = {"next": entry["id"], "payload": protocol.b64(blob)}
+            envelope = {"next": entry["id"], "reply_pub": reply_pub,
+                        "payload": protocol.b64(blob)}
 
         first = self.node_path[0]
         protocol.send_msg(self._hop_socks[first["id"]],
                           {"type": "forward", "payload": envelope["payload"]})
 
     def wait_reply(self, timeout: float = 15.0) -> str:
-        """Wait for the exit node to return the destination's answer."""
-        conn = self.accept_connection(timeout=timeout)
-        try:
-            text, _sender = self.recv_message(conn)
-            return text
-        finally:
-            conn.close()
+        """Read the reply back from our entry connection and strip every layer.
+
+        One node added one encryption layer per hop on the way back, so we
+        remove exactly ``len(node_path)`` layers with our private key.
+        """
+        if not self.node_path:
+            raise RuntimeError("call init_connecting() before wait_reply()")
+
+        entry = self.node_path[0]
+        sock = self._hop_socks[entry["id"]]
+        if timeout is not None:
+            sock.settimeout(timeout)
+
+        msg = protocol.recv_msg(sock)
+        if msg.get("type") != "reply":
+            raise protocol.ProtocolError(f"unexpected message: {msg.get('type')!r}")
+
+        blob = protocol.unb64(msg["payload"])
+        for _ in range(len(self.node_path)):
+            blob = self.rsa.decrypt_message(blob)
+        return blob.decode()
 
     # -- helpers --------------------------------------------------------
     def close(self) -> None:

@@ -55,7 +55,14 @@ network data instead (2 by default).
 
 ## How the reply comes back
 
-`client A` seals its own `ip:port` as `reply_to` inside the innermost RSA
-layer, the one only the exit node can open.  The exit node delivers the
-message to server B, reads server B's `hello` on that same socket, and —
-being the only node that knows the address — connects back to client A.
+The reply rides the circuit back — nothing needs to know an address.
+
+`client A` puts its public key (`reply_pub`) in every onion layer.  The
+exit node delivers the message to server B, reads server B's `hello` back,
+encrypts it once with A's public key and hands it to the **previous hop**.
+Each node does the same: it adds one more layer with A's public key and
+passes it back, until the entry node hands it to A.  Every node only ever
+knows the hop before it and the hop after it.
+
+`client A` then strips one layer per hop (`N` nodes -> `N` layers) with its
+private key and reads the message.

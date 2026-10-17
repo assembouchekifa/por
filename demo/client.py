@@ -51,23 +51,19 @@ def run_sender(args) -> None:
     sender = Client(dir_host=args.dir_host, dir_port=args.dir_port,
                     keysize=config.KEY_SIZE)
 
-    # our own listener: only the exit node will learn this address
-    host, port = sender.listen(config.HOST, 0)
-    reply_addr = fmt_addr(host, port)
-
     path = [node_id.strip() for node_id in args.via.split(",")] if args.via else None
     circuit = sender.init_connecting(hops=args.hops, path=path)
     route = " -> ".join(entry["id"] for entry in circuit)
     print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']})", flush=True)
-    print(f"[sender] reply address kept secret from all but the exit: {reply_addr}",
-          flush=True)
 
     try:
-        sender.send_message(args.send, args.to, reply_to=reply_addr)
-        print(f"[sender] sent to {args.to}: {args.send!r}", flush=True)
+        sender.send_message(args.send, args.to)
+        print(f"[sender] sent to {args.to}: {args.send!r} "
+              f"(no address of ours left this machine)", flush=True)
 
         reply = sender.wait_reply(timeout=args.timeout)
-        print(f"[sender] reply from destination: {reply!r}", flush=True)
+        print(f"[sender] stripped {len(circuit)} layers -> "
+              f"reply from destination: {reply!r}", flush=True)
     except KeyboardInterrupt:
         print("\n[sender] stopped", flush=True)
     finally:
