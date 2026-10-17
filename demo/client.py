@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Por client script - hidden server, or sender.  Clients are anonymous:
+they have no id, only nodes are identified.
+
+Server mode (server B, knows nothing about who connects):
+    .venv/bin/python demo/client.py --server --port 8000
+
+Sender mode (client A, circuit + reply listener):
+    .venv/bin/python demo/client.py --send hi \
+        --to 127.0.0.1:8000 --via node1,node3,node2
+
+Drop --via and the client picks --hops random nodes from the directory.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import config
+from src import protocol
+from src.client import Client
+from src.protocol import fmt_addr, parse_addr
+
+
+def run_server(args) -> None:
+    server = Client(host=config.HOST, keysize=config.KEY_SIZE)
+    host, port = server.listen(config.HOST, args.port)
+    print(f"[server] listening on {fmt_addr(host, port)} "
+          f"(no id, no circuit, no idea who will connect)", flush=True)
+    try:
+        while True:
+            conn = server.accept_connection()
+            try:
+                text, _sender = server.recv_message(conn)
+            except (ConnectionError, OSError, protocol.ProtocolError):
+                conn.close()
+                continue  # someone just probed the port, or went away
+            print(f"[server] received from exit node: {text!r}", flush=True)
+            server.reply(conn, args.reply)
+            print(f"[server] replied: {args.reply!r}", flush=True)
+            conn.close()
+    except KeyboardInterrupt:
+        print("\n[server] stopped", flush=True)
+    finally:
+        server.close()
+
+
+def run_sender(args) -> None:
+    sender = Client(dir_host=args.dir_host, dir_port=args.dir_port,
+                    keysize=config.KEY_SIZE)
+
+    # our own listener: only the exit node will learn this address
+    host, port = sender.listen(config.HOST, 0)
+    reply_addr = fmt_addr(host, port)
+
+    path = [node_id.strip() for node_id in args.via.split(",")] if args.via else None
+    circuit = sender.init_connecting(hops=args.hops, path=path)
+    route = " -> ".join(entry["id"] for entry in circuit)
+    print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']})", flush=True)
+    print(f"[sender] reply address kept secret from all but the exit: {reply_addr}",
+          flush=True)
+
+    try:
+        sender.send_message(args.send, args.to, reply_to=reply_addr)
+        print(f"[sender] sent to {args.to}: {args.send!r}", flush=True)
+
+        reply = sender.wait_reply(timeout=args.timeout)
+        print(f"[sender] reply from destination: {reply!r}", flush=True)
+    except KeyboardInterrupt:
+        print("\n[sender] stopped", flush=True)
+    finally:
+        sender.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Por client (anonymous)")
+    parser.add_argument("--dir-host", default=config.HOST)
+    parser.add_argument("--dir-port", type=int, default=config.DIR_PORT)
+
+    parser.add_argument("--server", action="store_true",
+                        help="run as a plain destination server (e.g. server B)")
+    parser.add_argument("--port", type=int, default=config.B_PORT,
+                        help="port to listen on in --server mode")
+    parser.add_argument("--reply", default="hello",
+                        help="fixed reply sent back by --server mode")
+
+    parser.add_argument("--send", default=None, metavar="TEXT",
+                        help="send this message (sender mode)")
+    parser.add_argument("--to", default=None, metavar="IP:PORT",
+                        help="destination server address for --send")
+    parser.add_argument("--via", default=None,
+                        help="comma separated node ids forming the circuit, "
+                             "e.g. node1,node3,node2 (last one is the exit)")
+    parser.add_argument("--hops", type=int, default=config.CIRCUIT_HOPS,
+                        help="random circuit length when --via is not given")
+    parser.add_argument("--timeout", type=float, default=15.0,
+                        help="seconds to wait for the reply")
+    args = parser.parse_args()
+
+    if args.server:
+        run_server(args)
+        return
+
+    if not args.send:
+        parser.error("sender mode requires --send TEXT")
+    if not args.to:
+        parser.error("sender mode requires --to IP:PORT")
+    parse_addr(args.to)  # fail fast on a bad address
+    run_sender(args)
+
+
+if __name__ == "__main__":
+    main()
