@@ -1,13 +1,18 @@
-"""Por client (UML box: ``client``).
+"""Por client sender (UML box: ``client``, the sending half).
 
-Two personalities live in this class:
+The destination half of the design (server B) lives alone in
+:mod:`src.server` - this class only *sends*:
 
-* **server** - the hidden destination (e.g. server B).  It calls
-  :meth:`listen` and has no idea who connects to it: it only reads the
-  message the exit node delivers and replies on the same socket.
-* **sender** - client A.  It fetches the network data from the directory
-  authorities, calculates a circuit (:meth:`calc_path`) and pushes an
-  onion-encrypted message into it.
+* it fetches the network data from the directory authorities
+  (:meth:`get_data_of_network`), calculates a circuit (:meth:`calc_path`)
+  and pushes an onion-encrypted message into it.
+
+There is **no client handshake**.  The circuit's nodes are directory data
+(host, port and every node's public key come from the directory), and the
+client's own public key rides inside each onion layer as ``reply_pub`` -
+that is how replies find their way back.  Only one socket is opened, to
+the entry (start) node; every other hop is reached by the nodes
+themselves.
 
 The reply does not need an address: it rides the circuit back.  Each node
 adds one encryption layer with the sender's public key as it hands the
@@ -24,63 +29,13 @@ from .rsa import Rsa
 
 
 class Client:
-    def __init__(self, host: str = "127.0.0.1", port: int = 0,
-                 dir_host: str = "127.0.0.1", dir_port: int = 9000,
+    def __init__(self, dir_host: str = "127.0.0.1", dir_port: int = 9000,
                  keysize: int = 2048):
-        self.host = host
-        self.port = port
         self.dir_addr = (dir_host, dir_port)
         self.rsa = Rsa(keysize)
         self.node_path = []        # ordered [{"id", "host", "port", ...}]
         self.rsa_of_nodes = {}     # node id -> public key
-        self._hop_socks = {}       # node id -> live socket
-        self._listener = None
-
-    # -- server mode ----------------------------------------------------
-    def listen(self, host: str = None, port: int = 0):
-        """Start the plain TCP server used to receive messages.
-
-        Returns the real ``(host, port)`` we bound (port 0 -> ephemeral).
-        """
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((host or self.host, port))
-        srv.listen(8)
-        self._listener = srv
-        self.host, self.port = self.local_addr
-        return self.local_addr
-
-    @property
-    def local_addr(self):
-        if self._listener is None:
-            raise RuntimeError("call listen() first")
-        host, port = self._listener.getsockname()[:2]
-        return host, port
-
-    def accept_connection(self, timeout: float = None):
-        """Wait for the exit node to connect and return the socket."""
-        if self._listener is None:
-            raise RuntimeError("call listen() first")
-        if timeout is not None:
-            self._listener.settimeout(timeout)
-        try:
-            conn, _addr = self._listener.accept()
-        finally:
-            if timeout is not None:
-                self._listener.settimeout(None)
-        conn.settimeout(timeout)
-        return conn
-
-    def recv_message(self, conn):
-        """Read one delivered message. Returns ``(text, sender)``."""
-        msg = protocol.recv_msg(conn)
-        if msg.get("type") != "deliver":
-            raise protocol.ProtocolError(f"unexpected message: {msg.get('type')!r}")
-        return msg.get("text", ""), msg.get("from")
-
-    def reply(self, conn, text: str) -> None:
-        """Answer on the connection the exit node opened to us."""
-        protocol.send_msg(conn, {"type": "reply", "text": text})
+        self._entry_sock = None    # the one live socket: us -> entry node
 
     # -- directory ------------------------------------------------------
     def get_data_of_network(self):
@@ -104,10 +59,21 @@ class Client:
                                f"but network only has {len(network)} nodes")
         return random.sample(network, length)
 
+    def _node_key(self, entry) -> "Rsa":
+        """Public key of a node, straight from directory data (no handshake)."""
+        pem = entry.get("public_key")
+        if not pem:
+            raise RuntimeError(f"node {entry['id']} published no public key "
+                               f"in the directory")
+        return self.rsa.import_public(pem)
+
     def init_connecting(self, hops: int = 2, path=None):
         """Build the circuit: explicit ``path`` of node ids, or ``hops`` random.
 
-        The last node of the circuit is the exit node.
+        The last node of the circuit is the exit node.  Nothing is
+        negotiated on the wire: every node's address and public key comes
+        from the directory, and the only connection we open is to the
+        entry node - the client's key travels later, inside the onion.
         """
         if path:
             self.node_path = [self.get_client(node_id) for node_id in path]
@@ -117,11 +83,11 @@ class Client:
         else:
             self.node_path = self.calc_path(self.get_data_of_network(), hops)
 
-        for entry in self.node_path:
-            sock = socket.create_connection((entry["host"], entry["port"]))
-            _peer_id, peer_pem = protocol.handshake(sock, self.rsa)
-            self.rsa_of_nodes[entry["id"]] = self.rsa.import_public(peer_pem)
-            self._hop_socks[entry["id"]] = sock
+        self.rsa_of_nodes = {entry["id"]: self._node_key(entry)
+                             for entry in self.node_path}
+
+        entry = self.node_path[0]
+        self._entry_sock = socket.create_connection((entry["host"], entry["port"]))
         return self.node_path
 
     def send_message(self, text: str, target_addr: str) -> None:
@@ -133,6 +99,8 @@ class Client:
         """
         if not self.node_path:
             raise RuntimeError("call init_connecting() before send_message()")
+        if self._entry_sock is None:
+            raise RuntimeError("no entry connection - call init_connecting()")
 
         reply_pub = self.rsa.export_public()
 
@@ -141,27 +109,28 @@ class Client:
                     "payload": protocol.b64(text.encode())}
 
         # wrap one RSA layer per hop, exit first (encdata1L, then encdat2L, ...)
-        for entry in reversed(self.node_path):
+        for node in reversed(self.node_path):
             blob = self.rsa.encrypt_message(json.dumps(envelope).encode(),
-                                            self.rsa_of_nodes[entry["id"]])
-            envelope = {"next": entry["id"], "reply_pub": reply_pub,
+                                            self.rsa_of_nodes[node["id"]])
+            envelope = {"next": node["id"], "reply_pub": reply_pub,
                         "payload": protocol.b64(blob)}
 
-        first = self.node_path[0]
-        protocol.send_msg(self._hop_socks[first["id"]],
-                          {"type": "forward", "payload": envelope["payload"]})
+        protocol.send_msg(self._entry_sock,
+                          {"type": "forward", "from": "client",
+                           "payload": envelope["payload"]})
 
     def wait_reply(self, timeout: float = 15.0) -> str:
-        """Read the reply back from our entry connection and strip every layer.
+        """Read the reply back from the entry node and strip every layer.
 
         One node added one encryption layer per hop on the way back, so we
         remove exactly ``len(node_path)`` layers with our private key.
         """
         if not self.node_path:
             raise RuntimeError("call init_connecting() before wait_reply()")
+        if self._entry_sock is None:
+            raise RuntimeError("no entry connection - call init_connecting()")
 
-        entry = self.node_path[0]
-        sock = self._hop_socks[entry["id"]]
+        sock = self._entry_sock
         if timeout is not None:
             sock.settimeout(timeout)
 
@@ -176,15 +145,9 @@ class Client:
 
     # -- helpers --------------------------------------------------------
     def close(self) -> None:
-        for sock in self._hop_socks.values():
+        if self._entry_sock is not None:
             try:
-                sock.close()
+                self._entry_sock.close()
             except OSError:
                 pass
-        self._hop_socks.clear()
-        if self._listener is not None:
-            try:
-                self._listener.close()
-            except OSError:
-                pass
-            self._listener = None
+            self._entry_sock = None

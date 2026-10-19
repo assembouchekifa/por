@@ -34,8 +34,9 @@ Terminal 2..n - relay nodes:
 .venv/bin/python demo/node.py --id node3 --port 7003
 ```
 
-Terminal - server B.  It is a plain TCP server: it has no id, no circuit,
-and does not know who is connecting or where the message came from.
+Terminal - server B.  It is a plain TCP server: it has no id, no keys,
+no circuit, and does not know who is connecting or where the message
+came from.
 
 ```
 .venv/bin/python demo/client.py --server --port 8000
@@ -52,6 +53,25 @@ Clients have no `--id`: only nodes are identified (their id is what they
 register with `server.py`).  `--to` is the destination **ip:port** (server
 B).  Leave `--via` out and client A picks `--hops` random nodes from the
 network data instead (2 by default).
+
+## Keys, heartbeats, no handshakes
+
+There is exactly **one** key test in the whole network: when a node
+registers, the directory encrypts a random nonce with the node's public
+key and expects it back decrypted.  The directory keeps no keypair of its
+own - it only checks that the node really owns the key it published, and
+refuses the registration otherwise.
+
+Nothing else handshakes.  Nodes fetch each other's address **and public
+key** from the directory and open plain TCP links; client A gets every
+node's public key the same way; server B has no keys at all.
+
+A live node sends a `heartbeat` to the directory every **60 seconds**.
+The directory sweeps every **90 seconds** and forgets any node silent for
+more than **90 seconds**.  A forgotten node is not gone for good: its
+next heartbeat gets an `error: not registered` reply (or its connection
+dies), which makes it **re-register** - a dead node coming back just
+registers again.
 
 ## How the reply comes back
 

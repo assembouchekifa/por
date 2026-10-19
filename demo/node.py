@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Por relay node script.
 
+Registers with the directory (proving the published public key), then
+heartbeats every 60s - if the directory drops it or restarts, the node
+re-registers on its own.
+
 Usage:
     .venv/bin/python demo/node.py --id node1 [--port PORT]
 """

@@ -51,16 +51,27 @@ class Rsa:
         self.node_public[node_id] = self.import_public(pem)
 
     # -- messages -------------------------------------------------------
-    def encrypt_message(self, data, pubkey) -> bytes:
-        """Encrypt ``data`` (str or bytes) with ``pubkey``, chunked."""
+    @staticmethod
+    def encrypt_for(data, pubkey) -> bytes:
+        """Encrypt ``data`` (str or bytes) with ``pubkey``, chunked.
+
+        Needs no keypair of its own, so anyone who only *holds* a peer's
+        public key (e.g. the directory server testing a node) can use it.
+        """
         if isinstance(data, str):
             data = data.encode()
         if not data:
             return b""
+        block = (pubkey.n.bit_length() + 7) // 8
+        chunk = block - 11  # PKCS#1 overhead
         out = bytearray()
-        for i in range(0, len(data), self.chunk_size):
-            out += _rsa.encrypt(data[i:i + self.chunk_size], pubkey)
+        for i in range(0, len(data), chunk):
+            out += _rsa.encrypt(data[i:i + chunk], pubkey)
         return bytes(out)
+
+    def encrypt_message(self, data, pubkey) -> bytes:
+        """Encrypt ``data`` (str or bytes) with ``pubkey``, chunked."""
+        return self.encrypt_for(data, pubkey)
 
     def decrypt_message(self, cipher: bytes) -> bytes:
         """Decrypt what :meth:`encrypt_message` produced, using ``prive``."""

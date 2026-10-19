@@ -3,16 +3,23 @@
 Every message is a JSON object framed with a 4-byte big-endian length
 prefix and sent over a plain Linux TCP socket.
 
-The handshake is a standard RSA challenge/response:
+Key ownership is a one-way RSA test, run only between a node and the
+directory authorities server when the node registers:
 
-    initiator -> responder : {"type": "handshake",     "id", "public_key"}
-    responder -> initiator : {"type": "handshake_ok",  "id", "public_key", "enc"}
-    initiator -> responder : {"type": "handshake_done", "dec", "enc"}
-    responder -> initiator : {"type": "handshake_result", "dec"}
+    node       -> directory : {"type": "register",        "id", "host", "port", "public_key"}
+    directory  -> node      : {"type": "challenge",       "enc"}
+    node       -> directory : {"type": "challenge_reply", "dec"}
+    directory  -> node      : {"type": "ok"}
 
-``enc`` is a random nonce encrypted with the peer's public key, ``dec`` is
-that nonce decrypted back.  Only the owner of the private key can produce
-``dec``, so both sides end up trusting each other's public key.
+``enc`` is a random nonce encrypted with the node's public key, ``dec``
+is that nonce decrypted back.  Only the owner of the private key can
+produce ``dec``, so the directory learns the registered public key is
+real without ever owning a keypair itself.
+
+Nothing else on the wire handshakes: nodes fetch each other's public keys
+from the directory, the client puts its own public key (``reply_pub``)
+inside every onion layer so replies can come back, and the exit node
+talks to the destination server in plain text.
 """
 
 import base64
@@ -22,6 +29,14 @@ import socket
 import struct
 
 MAX_MSG_SIZE = 64 * 1024 * 1024  # 64 MiB safety cap
+
+# -- keepalive cadence -------------------------------------------------
+# a live node pings the directory this often...
+HEARTBEAT_EVERY = 60      # seconds between node -> directory heartbeats
+# ...and the directory sweeps entries this often, dropping anything that
+# missed ~1.5 heartbeats (so a healthy node is never swept by accident).
+CLEANUP_EVERY = 90        # seconds between stale-entry sweeps
+STALE_AFTER = 90          # seconds without a heartbeat -> node is dropped
 
 
 class ProtocolError(Exception):
@@ -70,38 +85,56 @@ def recv_msg(sock: socket.socket) -> dict:
     return json.loads(recv_exact(sock, size).decode())
 
 
-def handshake(sock: socket.socket, rsa_obj, my_id: str = None):
-    """Run the initiator (client) side of the RSA handshake.
+# -- key ownership test (node <-> directory only) ----------------------
+def test_key(sock: socket.socket, public_pem) -> bytes:
+    """Directory side of the key test: challenge + verify, no keypair here.
 
-    ``my_id`` is optional: clients are anonymous and send no id, nodes do.
-    Returns ``(peer_id, peer_public_key_pem)``.
+    Encrypts a random nonce with ``public_pem`` and expects it back in
+    plaintext.  The directory never creates a public/private key of its
+    own - it only *tests* that the node owns the private key of the
+    public key it sent.  Returns the nonce that was proven, raises
+    :class:`ProtocolError` if the peer fails the test.
+    """
+    from .rsa import Rsa  # local import to avoid a cycle at module load
+
+    pub = Rsa.import_public(public_pem)
+    nonce = os.urandom(16)
+    send_msg(sock, {"type": "challenge",
+                    "enc": b64(Rsa.encrypt_for(nonce, pub))})
+
+    reply = recv_msg(sock)
+    if reply.get("type") != "challenge_reply":
+        raise ProtocolError(f"expected challenge_reply, "
+                            f"got {reply.get('type')!r}")
+    try:
+        proven = unb64(reply["dec"])
+    except (KeyError, ValueError, TypeError) as exc:  # missing/garbage answer
+        raise ProtocolError(f"bad key test reply: {exc}")
+    if proven != nonce:
+        raise ProtocolError("key test failed: peer does not own its private key")
+    return nonce
+
+
+def prove_key(sock: socket.socket, rsa_obj) -> bytes:
+    """Node side of the key test: answer the directory's challenge.
+
+    This response used to live inside the node; it is a protocol
+    exchange, so it belongs here.  Returns the decrypted nonce.
     """
     from .rsa import Rsa  # local import to avoid a cycle at module load
 
     if not isinstance(rsa_obj, Rsa):  # pragma: no cover - sanity check
         raise TypeError("rsa_obj must be a src.rsa.Rsa instance")
 
-    send_msg(sock, {"type": "handshake", "id": my_id,
-                    "public_key": rsa_obj.export_public()})
+    challenge = recv_msg(sock)
+    if challenge.get("type") != "challenge":
+        raise ProtocolError(f"expected challenge, got {challenge.get('type')!r}")
 
-    reply = recv_msg(sock)
-    if reply.get("type") != "handshake_ok":
-        raise ProtocolError(f"expected handshake_ok, got {reply.get('type')!r}")
-    peer_id = reply["id"]
-    peer_pub = rsa_obj.import_public(reply["public_key"])
-
-    # prove we can read what was encrypted for us, then challenge the peer
-    nonce_back = rsa_obj.decrypt_message(unb64(reply["enc"]))
-    my_nonce = os.urandom(16)
-    send_msg(sock, {"type": "handshake_done",
-                    "dec": b64(nonce_back),
-                    "enc": b64(rsa_obj.encrypt_message(my_nonce, peer_pub))})
-
-    result = recv_msg(sock)
-    if result.get("type") != "handshake_result":
-        raise ProtocolError(f"expected handshake_result, got {result.get('type')!r}")
-    if unb64(result["dec"]) != my_nonce:
-        raise ProtocolError("handshake failed: peer does not own its private key")
-
-    rsa_obj.remember_node(peer_id, reply["public_key"])
-    return peer_id, reply["public_key"]
+    try:
+        nonce = rsa_obj.decrypt_message(unb64(challenge["enc"]))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ProtocolError(f"bad challenge: {exc}")
+    except Exception as exc:  # rsa.lib DecryptionError etc. -> protocol level
+        raise ProtocolError(f"cannot answer challenge: {exc}")
+    send_msg(sock, {"type": "challenge_reply", "dec": b64(nonce)})
+    return nonce

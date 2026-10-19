@@ -4,5 +4,6 @@ from .client import Client
 from .dataServer import DataServer
 from .node import Node
 from .rsa import Rsa
+from .server import Server
 
-__all__ = ["Client", "DataServer", "Node", "Rsa"]
+__all__ = ["Client", "DataServer", "Node", "Rsa", "Server"]

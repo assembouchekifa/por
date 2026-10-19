@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Directory authorities server script.
 
+Nodes register here and prove they own the public key they publish; a
+stale sweep drops anyone silent for 90s (nodes heartbeat every 60s).
+
 Usage:
     .venv/bin/python demo/server.py [--host HOST] [--port PORT]
 """

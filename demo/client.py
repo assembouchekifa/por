@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Por client script - hidden server, or sender.  Clients are anonymous:
-they have no id, only nodes are identified.
+they have no id, only nodes are identified.  Neither side handshakes:
+the sender's public key rides inside the onion layers, and node keys are
+directory data.
 
-Server mode (server B, knows nothing about who connects):
+Server mode (server B, no keys, no id, knows nothing about who connects):
     .venv/bin/python demo/client.py --server --port 8000
 
 Sender mode (client A, circuit + reply listener):
@@ -22,13 +24,14 @@ import config
 from src import protocol
 from src.client import Client
 from src.protocol import fmt_addr, parse_addr
+from src.server import Server
 
 
 def run_server(args) -> None:
-    server = Client(host=config.HOST, keysize=config.KEY_SIZE)
+    server = Server(config.HOST, args.port)
     host, port = server.listen(config.HOST, args.port)
     print(f"[server] listening on {fmt_addr(host, port)} "
-          f"(no id, no circuit, no idea who will connect)", flush=True)
+          f"(no id, no keys, no circuit, no idea who will connect)", flush=True)
     try:
         while True:
             conn = server.accept_connection()
@@ -54,7 +57,8 @@ def run_sender(args) -> None:
     path = [node_id.strip() for node_id in args.via.split(",")] if args.via else None
     circuit = sender.init_connecting(hops=args.hops, path=path)
     route = " -> ".join(entry["id"] for entry in circuit)
-    print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']})", flush=True)
+    print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']}), "
+          f"keys from the directory, no handshake", flush=True)
 
     try:
         sender.send_message(args.send, args.to)
@@ -76,7 +80,7 @@ def main() -> None:
     parser.add_argument("--dir-port", type=int, default=config.DIR_PORT)
 
     parser.add_argument("--server", action="store_true",
-                        help="run as a plain destination server (e.g. server B)")
+                        help="run as a plain, keyless destination server (server B)")
     parser.add_argument("--port", type=int, default=config.B_PORT,
                         help="port to listen on in --server mode")
     parser.add_argument("--reply", default="hello",
