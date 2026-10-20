@@ -7,9 +7,10 @@ One command runs the whole architecture from `architecture.md`:
 ```
 
 That starts the directory authorities server, three relay nodes, server B
-and then client A pushes `hi` through `node1 -> node3 -> node2`.  node2 is
-the **exit** node, so it is the only one that learns client A's reply
-address and can return server B's `hello`.
+and then client A builds **one circuit** `node1 -> node3 -> node2` and
+pushes two messages through it - `hi`, then `same circuit, still here`.
+node2 is the **exit** node, so it is the only one that learns client A's
+reply address and can return server B's answers.
 
 Use `--via` to pick any circuit, the number of nodes is up to you (the last
 one is the exit):
@@ -42,10 +43,11 @@ came from.
 .venv/bin/python demo/client.py --server --port 8000
 ```
 
-Terminal - client A sends and waits for the reply:
+Terminal - client A.  Repeat `--send` to push several messages through
+the same circuit; the connection stays open (chat style):
 
 ```
-.venv/bin/python demo/client.py --send hi \
+.venv/bin/python demo/client.py --send hi --send "and again" \
     --to 127.0.0.1:8000 --via node1,node3,node2
 ```
 
@@ -53,6 +55,33 @@ Clients have no `--id`: only nodes are identified (their id is what they
 register with `server.py`).  `--to` is the destination **ip:port** (server
 B).  Leave `--via` out and client A picks `--hops` random nodes from the
 network data instead (2 by default).
+
+## Persistent links, not one connection per message
+
+Every link in the network is opened **once and reused** (chat style):
+
+* client A opens one connection to the entry node and keeps it for every
+  later message - `init_connection()` once, `send_message()` as often as
+  you like;
+* each node keeps a pooled connection per neighbour (`node -> node`), so
+  a hop does not dial TCP again for every packet;
+* the exit node keeps a pooled connection per destination server, and
+  server B keeps one per exit node.
+
+Every forward carries a random **`msg_id`** that the reply echoes back.
+Each node remembers `msg_id -> the link the packet came in on`, so
+replies are routed back the moment they arrive and many messages can be
+in flight over the same circuit at once - nothing is matched by "whichever
+socket the answer happened to land on".
+
+A background reader thread owns each link, which is what makes the chat
+work: replies show up whenever they come back and are pushed into an
+inbox instead of blocking the sender.
+
+Keepalive: client A pings the entry node every **30 seconds**, and every
+node pings its pooled neighbours the same way.  A link that misses its
+pong is dropped; the next send rebuilds the circuit (the same node ids
+first, random ones if they are gone).
 
 ## Keys, heartbeats, no handshakes
 
@@ -75,10 +104,10 @@ registers again.
 
 ## How the reply comes back
 
-The reply rides the circuit back — nothing needs to know an address.
+The reply rides the circuit back - nothing needs to know an address.
 
 `client A` puts its public key (`reply_pub`) in every onion layer.  The
-exit node delivers the message to server B, reads server B's `hello` back,
+exit node delivers the message to server B, reads server B's answer back,
 encrypts it once with A's public key and hands it to the **previous hop**.
 Each node does the same: it adds one more layer with A's public key and
 passes it back, until the entry node hands it to A.  Every node only ever

@@ -2,7 +2,6 @@
 
 Members from the design:
     - dir client  : socket   : live registry of nodes/clients (id -> entry)
-    - getAllClient -> get_all_clients()
     - getclient    -> get_client()
 
 Nodes register here - and registration is the *only* place where keys are
@@ -155,9 +154,6 @@ class DataServer:
         if kind == "get_client":
             return {"type": "client_data", "client": self.get_client(msg.get("id"))}
 
-        if kind == "get_all_clients":
-            return {"type": "clients_data", "clients": self.get_all_clients()}
-
         if kind == "unregister":
             with self._lock:
                 self.dir_client.pop(msg.get("id"), None)
@@ -200,11 +196,3 @@ class DataServer:
             if entry is None:
                 return None
             return {k: v for k, v in entry.items() if k not in ("sock", "seen")} | {"id": client_id}
-
-    def get_all_clients(self):
-        """Public info about every registered node/client."""
-        with self._lock:
-            return [
-                {k: v for k, v in entry.items() if k not in ("sock", "seen")} | {"id": cid}
-                for cid, entry in self.dir_client.items()
-            ]

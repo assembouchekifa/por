@@ -1,7 +1,14 @@
 """Shared wire protocol for Por.
 
 Every message is a JSON object framed with a 4-byte big-endian length
-prefix and sent over a plain Linux TCP socket.
+prefix and sent over a plain Linux TCP socket wrapped in a :class:`Link`.
+
+Links are **persistent**: one TCP connection per peer is opened on first
+use and reused for every later message (chat style), instead of dialling
+a new connection per packet.  Every request carries a random ``msg_id``
+and the answer echoes it back, so many messages can be in flight over the
+same link and replies are matched by id - not by "whichever socket the
+answer happened to arrive on".
 
 Key ownership is a one-way RSA test, run only between a node and the
 directory authorities server when the node registers:
@@ -27,6 +34,10 @@ import json
 import os
 import socket
 import struct
+import threading
+import uuid
+
+from .keys import Rsa
 
 MAX_MSG_SIZE = 64 * 1024 * 1024  # 64 MiB safety cap
 
@@ -37,6 +48,10 @@ HEARTBEAT_EVERY = 60      # seconds between node -> directory heartbeats
 # missed ~1.5 heartbeats (so a healthy node is never swept by accident).
 CLEANUP_EVERY = 90        # seconds between stale-entry sweeps
 STALE_AFTER = 90          # seconds without a heartbeat -> node is dropped
+# pooled peer links (client -> entry, node -> node, exit -> destination)
+# are pinged this often so a dead link is noticed before it is used.
+LINK_PING_EVERY = 30      # seconds between link pings
+LINK_PING_TIMEOUT = 5.0   # seconds to wait for a pong before dropping
 
 
 class ProtocolError(Exception):
@@ -85,6 +100,45 @@ def recv_msg(sock: socket.socket) -> dict:
     return json.loads(recv_exact(sock, size).decode())
 
 
+def new_id() -> str:
+    """Fresh correlation id for one request/reply pair."""
+    return uuid.uuid4().hex
+
+
+class Link:
+    """One persistent TCP link: a socket plus a write lock.
+
+    Reading and writing are independent (TCP is full duplex), but two
+    threads must never *write* at the same time - otherwise their frames
+    interleave on the wire.  The lock serializes writers; readers are
+    expected to live in a single thread per link.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._write_lock = threading.Lock()
+
+    def send(self, obj: dict) -> None:
+        with self._write_lock:
+            send_msg(self.sock, obj)
+
+    def recv(self) -> dict:
+        return recv_msg(self.sock)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        try:
+            peer = "%s:%s" % self.sock.getpeername()[:2]
+        except OSError:
+            peer = "closed"
+        return f"<Link {peer}>"
+
+
 # -- key ownership test (node <-> directory only) ----------------------
 def test_key(sock: socket.socket, public_pem) -> bytes:
     """Directory side of the key test: challenge + verify, no keypair here.
@@ -95,8 +149,6 @@ def test_key(sock: socket.socket, public_pem) -> bytes:
     public key it sent.  Returns the nonce that was proven, raises
     :class:`ProtocolError` if the peer fails the test.
     """
-    from .rsa import Rsa  # local import to avoid a cycle at module load
-
     pub = Rsa.import_public(public_pem)
     nonce = os.urandom(16)
     send_msg(sock, {"type": "challenge",
@@ -121,10 +173,8 @@ def prove_key(sock: socket.socket, rsa_obj) -> bytes:
     This response used to live inside the node; it is a protocol
     exchange, so it belongs here.  Returns the decrypted nonce.
     """
-    from .rsa import Rsa  # local import to avoid a cycle at module load
-
     if not isinstance(rsa_obj, Rsa):  # pragma: no cover - sanity check
-        raise TypeError("rsa_obj must be a src.rsa.Rsa instance")
+        raise TypeError("rsa_obj must be a src.keys.Rsa instance")
 
     challenge = recv_msg(sock)
     if challenge.get("type") != "challenge":

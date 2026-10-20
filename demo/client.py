@@ -2,13 +2,14 @@
 """Por client script - hidden server, or sender.  Clients are anonymous:
 they have no id, only nodes are identified.  Neither side handshakes:
 the sender's public key rides inside the onion layers, and node keys are
-directory data.
+directory data.  Links are persistent (chat style): one circuit, one
+connection, as many messages as you want.
 
 Server mode (server B, no keys, no id, knows nothing about who connects):
     .venv/bin/python demo/client.py --server --port 8000
 
-Sender mode (client A, circuit + reply listener):
-    .venv/bin/python demo/client.py --send hi \
+Sender mode (client A, circuit + persistent reply listener):
+    .venv/bin/python demo/client.py --send hi --send "still here" \
         --to 127.0.0.1:8000 --via node1,node3,node2
 
 Drop --via and the client picks --hops random nodes from the directory.
@@ -21,7 +22,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
-from src import protocol
 from src.client import Client
 from src.protocol import fmt_addr, parse_addr
 from src.server import Server
@@ -32,18 +32,15 @@ def run_server(args) -> None:
     host, port = server.listen(config.HOST, args.port)
     print(f"[server] listening on {fmt_addr(host, port)} "
           f"(no id, no keys, no circuit, no idea who will connect)", flush=True)
+
+    def handler(text: str) -> str:
+        print(f"[server] received from exit node: {text!r}", flush=True)
+        print(f"[server] replied: {args.reply!r}", flush=True)
+        return args.reply
+
     try:
-        while True:
-            conn = server.accept_connection()
-            try:
-                text, _sender = server.recv_message(conn)
-            except (ConnectionError, OSError, protocol.ProtocolError):
-                conn.close()
-                continue  # someone just probed the port, or went away
-            print(f"[server] received from exit node: {text!r}", flush=True)
-            server.reply(conn, args.reply)
-            print(f"[server] replied: {args.reply!r}", flush=True)
-            conn.close()
+        # one link per exit node, kept open for every later message
+        server.serve(handler, background=False)
     except KeyboardInterrupt:
         print("\n[server] stopped", flush=True)
     finally:
@@ -55,19 +52,22 @@ def run_sender(args) -> None:
                     keysize=config.KEY_SIZE)
 
     path = [node_id.strip() for node_id in args.via.split(",")] if args.via else None
-    circuit = sender.init_connecting(hops=args.hops, path=path)
+    circuit = sender.init_connection(hops=args.hops, path=path)
     route = " -> ".join(entry["id"] for entry in circuit)
     print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']}), "
-          f"keys from the directory, no handshake", flush=True)
+          f"one persistent link, keys from the directory, no handshake",
+          flush=True)
 
     try:
-        sender.send_message(args.send, args.to)
-        print(f"[sender] sent to {args.to}: {args.send!r} "
-              f"(no address of ours left this machine)", flush=True)
-
-        reply = sender.wait_reply(timeout=args.timeout)
-        print(f"[sender] stripped {len(circuit)} layers -> "
-              f"reply from destination: {reply!r}", flush=True)
+        for text in args.send:
+            msg_id = sender.send_message(text, args.to)
+            print(f"[sender] sent to {args.to}: {text!r} (msg_id {msg_id[:8]}, "
+                  f"no address of ours left this machine)", flush=True)
+            reply = sender.wait_reply(timeout=args.timeout, msg_id=msg_id)
+            print(f"[sender] stripped {len(circuit)} layers -> "
+                  f"reply from destination: {reply!r}", flush=True)
+        print(f"[sender] {len(args.send)} message(s) on the same circuit "
+              f"and the same connection", flush=True)
     except KeyboardInterrupt:
         print("\n[sender] stopped", flush=True)
     finally:
@@ -86,8 +86,9 @@ def main() -> None:
     parser.add_argument("--reply", default="hello",
                         help="fixed reply sent back by --server mode")
 
-    parser.add_argument("--send", default=None, metavar="TEXT",
-                        help="send this message (sender mode)")
+    parser.add_argument("--send", default=None, action="append", metavar="TEXT",
+                        help="send this message (sender mode); repeat the flag "
+                             "to send several over the same circuit")
     parser.add_argument("--to", default=None, metavar="IP:PORT",
                         help="destination server address for --send")
     parser.add_argument("--via", default=None,
@@ -96,15 +97,14 @@ def main() -> None:
     parser.add_argument("--hops", type=int, default=config.CIRCUIT_HOPS,
                         help="random circuit length when --via is not given")
     parser.add_argument("--timeout", type=float, default=15.0,
-                        help="seconds to wait for the reply")
+                        help="seconds to wait for each reply")
     args = parser.parse_args()
 
     if args.server:
         run_server(args)
         return
 
-    if not args.send:
-        parser.error("sender mode requires --send TEXT")
+    args.send = args.send or ["hi"]
     if not args.to:
         parser.error("sender mode requires --to IP:PORT")
     parse_addr(args.to)  # fail fast on a bad address

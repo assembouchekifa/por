@@ -4,8 +4,9 @@
     directory authorities server
     3 relay nodes (node1, node2, node3)
     server B listening (it never learns who talks to it)
-    client A sends "hi" through node1 -> node3 -> node2 (exit)
-    the exit node returns server B's "hello" back to client A
+    client A builds ONE circuit node1 -> node3 -> node2 (exit)
+    client A sends "hi", then "still here" over the SAME link
+    server B's replies ride the same circuit back, A strips the layers
 
 Usage:
     .venv/bin/python demo/run_all.py [--via node1,node3,node2]
@@ -79,14 +80,16 @@ def main() -> None:
                            "--port", str(config.B_PORT)))
         wait_port(config.B_PORT)
 
-        print(f"\n=== 4. client A sends through {args.via} ===", flush=True)
+        print(f"\n=== 4. client A sends two messages through {args.via} ===",
+              flush=True)
         sender = spawn("demo/client.py", "--send", "hi",
+                       "--send", "same circuit, still here",
                        "--to", B_ADDR, "--via", args.via)
         procs.append(sender)
         sender.wait(timeout=60)
 
-        print("\n=== done: reply came back through every hop, A stripped all layers ===",
-              flush=True)
+        print("\n=== done: both replies came back through the same circuit "
+              "and the same connection, A stripped all layers ===", flush=True)
         time.sleep(0.5)
     finally:
         for proc in procs:
