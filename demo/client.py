@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Por client script - hidden server, or sender.  Clients are anonymous:
-they have no id, only nodes are identified.  Neither side handshakes:
-the sender's public key rides inside the onion layers, and node keys are
-directory data.  Links are persistent (chat style): one circuit, one
-connection, as many messages as you want.
+"""Por client script - hidden server, or sender.
 
 Server mode (server B, no keys, no id, knows nothing about who connects):
     .venv/bin/python demo/client.py --server --port 8000
@@ -23,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 from src.client import Client
+from src.log import configure_logging
 from src.protocol import fmt_addr, parse_addr
 from src.server import Server
 
@@ -39,7 +36,6 @@ def run_server(args) -> None:
         return args.reply
 
     try:
-        # one link per exit node, kept open for every later message
         server.serve(handler, background=False)
     except KeyboardInterrupt:
         print("\n[server] stopped", flush=True)
@@ -51,14 +47,15 @@ def run_sender(args) -> None:
     sender = Client(dir_host=args.dir_host, dir_port=args.dir_port,
                     keysize=config.KEY_SIZE)
 
-    path = [node_id.strip() for node_id in args.via.split(",")] if args.via else None
-    circuit = sender.init_connection(hops=args.hops, path=path)
-    route = " -> ".join(entry["id"] for entry in circuit)
-    print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']}), "
-          f"one persistent link, keys from the directory, no handshake",
-          flush=True)
-
     try:
+        path = ([node_id.strip() for node_id in args.via.split(",")]
+                if args.via else None)
+        circuit = sender.init_connection(hops=args.hops, path=path)
+        route = " -> ".join(entry["id"] for entry in circuit)
+        print(f"[sender] circuit ready: {route} (exit: {circuit[-1]['id']}), "
+              f"one persistent link, keys from the directory, no handshake",
+              flush=True)
+
         for text in args.send:
             msg_id = sender.send_message(text, args.to)
             print(f"[sender] sent to {args.to}: {text!r} (msg_id {msg_id[:8]}, "
@@ -100,6 +97,7 @@ def main() -> None:
                         help="seconds to wait for each reply")
     args = parser.parse_args()
 
+    configure_logging()
     if args.server:
         run_server(args)
         return

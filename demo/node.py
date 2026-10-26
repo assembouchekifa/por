@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
+from src.log import configure_logging
 from src.node import Node
 
 
@@ -30,16 +31,18 @@ def main() -> None:
     args = parser.parse_args()
 
     port = args.port if args.port is not None else config.NODES.get(args.id, 7001)
+    configure_logging()
 
     node = Node(args.id, args.host, port, args.dir_host, args.dir_port,
                 keysize=config.KEY_SIZE)
-    print(f"[node {args.id}] listening on {args.host}:{port}, "
-          f"directory {args.dir_host}:{args.dir_port} - registered", flush=True)
+    print(f"[node {args.id}] starting on {args.host}:{port}, "
+          f"directory {args.dir_host}:{args.dir_port}", flush=True)
     try:
         node.start(background=False)
     except KeyboardInterrupt:
-        node.stop()
         print(f"\n[node {args.id}] stopped", flush=True)
+    finally:
+        node.stop()
 
 
 if __name__ == "__main__":

@@ -1,119 +1,207 @@
 # Por
 
-> it is tor browser writing in python to send messages only
+Por is a small, readable Tor-like messaging network written in Python. It
+builds an onion circuit through relay nodes, sends an encrypted message to a
+plain TCP destination server, and routes the reply back through the same
+circuit. It is a learning/demo project, **not** a replacement for Tor.
 
-  
+## What it does
 
-## ✦ Overview
+- The **directory** keeps a public phone-book of relay nodes. Nodes prove they
+  own the public key they publish.
+- A **client** builds a circuit (for example `node1 -> node3 -> node2`) and
+  wraps the message in one onion layer per hop.
+- Each **relay node** peels exactly one layer, forwards the rest, and remembers
+  where the reply belongs.
+- The **exit node** delivers plaintext to a keyless destination server and
+  carries the reply back.
+- The client strips one reply layer per hop.
 
-so this project add way to send messages like tor with multi PC to make it hard to track you and tor so popular so if some one wont track you and know there is tor traffic like will do some know attacks to get your data but with por this is herder because it implementation with clean room not tor in python
+Everything is persistent-link based: one client link, pooled node links and a
+pooled destination link per exit. Many messages can share the same circuit.
 
-## ✦ Features
+Full protocol, API, lifecycle, and troubleshooting documentation:
+[`document.md`](document.md).
 
-- Feature one
-    
-- Feature two
-    
-- Feature three
-    
-- Feature four
-    
-- Lightweight and minimal
-    
-- Easy to customize
-    
+## Requirements
 
-## ✦ Requirements
+- Python 3.10+
+- `cryptography` (see `requirements.txt`)
 
-- Linux
-    
-- Dependency 1
-    
-- Dependency 2
-    
-- Dependency 3
-    
+## Install
 
-## ✦ Installation
-
-### 1. Clone the repository
-
-```
-git clone https://github.com/USERNAME/REPOSITORY.git
-cd REPOSITORY
+```bash
+git clone <repo-url> por
+cd por
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Install dependencies
+## Run the full demo
 
-```
-# Install required packages here
-```
-
-### 3. Install / configure
-
-```
-# Installation commands here
+```bash
+.venv/bin/python demo/run_all.py
 ```
 
-### 4. Start
+That starts the directory, three relay nodes, server B (the hidden
+destination), and client A. Client A sends two messages through one circuit
+and one TCP connection, and prints the replies after removing all layers.
 
-```
-# Command to start the project
-```
+Choose a different circuit (the last node is the exit):
 
-## ✦ Configuration
-
-Configuration files are located in:
-
-```
-~/.config/
-├── application/
-├── another-app/
-└── project/
+```bash
+.venv/bin/python demo/run_all.py --via node2,node1
 ```
 
-Edit the configuration files to customize the project.
+## Run the pieces yourself
 
-## ✦ Usage
+Terminal 1:
 
-Explain the most common commands or workflow.
-
-```
-# Example
-command --option
+```bash
+.venv/bin/python demo/server.py
 ```
 
-## ✦ Project Structure
+Terminals 2-4:
 
-```
-.
-├── assets/
-├── config/
-├── scripts/
-├── README.md
-└── LICENSE
+```bash
+.venv/bin/python demo/node.py --id node1 --port 7001
+.venv/bin/python demo/node.py --id node2 --port 7002
+.venv/bin/python demo/node.py --id node3 --port 7003
 ```
 
-## ✦ License
+Terminal 5 - destination server B:
 
-This project is licensed under the **MIT License**.
+```bash
+.venv/bin/python demo/client.py --server --port 8000
+```
 
-See `[LICENSE](https://chatgpt.com/c/LICENSE)` for more information.
+Terminal 6 - sender A:
 
-## ✦ Credits
+```bash
+.venv/bin/python demo/client.py \
+    --send hi --send "still here" \
+    --to 127.0.0.1:8000 --via node1,node3,node2
+```
 
-Inspired by:
+Leave out `--via` and the client picks `--hops` random nodes from the
+directory (default 2).
 
-- Project or person
-    Tor
+## How the protocol works
 
-## ✦ Author
+### Framing
 
-**7aydara**
+Every frame is a 4-byte big-endian length followed by one UTF-8 JSON object.
+A malformed frame, an oversized frame, or a missing `type` becomes a
+`ProtocolError`; the role closes that connection instead of leaking a raw
+`JSONDecodeError` or `KeyError`.
 
-- GitHub: `@bouchekifaassem`
-    
+### Onion layers
 
----
+For a final destination `host:port`, the innermost envelope contains:
 
-> Built with patience, caffeine, and too much time in the terminal.
+```json
+{"next": "127.0.0.1:8000", "final": true,
+ "reply_pub": "<client public key>", "payload": "<base64 text>"}
+```
+
+Each node wraps the JSON envelope once with the next node's public key. A
+relay peels one layer and either forwards the rest or, for the final layer,
+delivers the text.
+
+### Crypto
+
+Each layer uses hybrid encryption: a fresh AES-256-GCM key encrypts the layer,
+and RSA-OAEP (SHA-256) wraps only that key. This is one RSA operation per
+layer instead of chunking the entire payload through RSA. GCM also detects
+tampering. Legacy chunked RSA ciphertext is still readable for compatibility.
+
+The directory's registration challenge uses the same hybrid path: the
+directory sends a random nonce encrypted with the node's public key, and the
+node must send the nonce back. The directory keeps no keypair.
+
+### Reply routing
+
+Every forwarded message gets a fresh random `msg_id` **per hop**. A node
+stores:
+
+```text
+hop_id -> (incoming link, client reply key, previous hop's id, expiry)
+```
+
+The reply returns on the pooled peer link, is matched by `hop_id`, gets one
+new encryption layer, and is sent back to the incoming link. The client
+matches the reply against the original `msg_id` and strips `len(circuit)`
+layers. Expired pending entries are swept; the routing table has a hard size
+cap.
+
+### Liveness
+
+- Nodes heartbeat the directory every 60 seconds.
+- The directory drops entries silent for 90 seconds and closes their links; an
+  evicted or restarted node re-registers automatically.
+- Client and node links are pinged every 30 seconds and dropped after a missed
+  pong. The next send rebuilds the circuit.
+- `wait_reply()` uses a condition variable, not the old get/put spin loop, and
+  raises `TimeoutError`.
+
+## Tests
+
+The test suite uses the standard library `unittest`:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Covered areas include framing/validation, hybrid crypto and legacy
+ciphertext, reply inbox behavior, explicit-path hop counts, directory
+registration/heartbeats/cleanup, full three-process circuit integration,
+malformed peers, and exit-delivery failures.
+
+## Project layout
+
+```text
+src/
+  config.py           shared Settings/defaults
+  errors.py           PorError / ProtocolError / CryptoError
+  log.py              logging + NullHandler default
+  wire.py             framing, JSON, base64, validation helpers
+  link.py             Link wrapper, connect(), keepalive
+  service.py          shared accept/stop/thread lifecycle
+  keys.py             hybrid RSA-OAEP + AES-256-GCM
+  protocol.py         public protocol facade + key ownership test
+  directory_client.py one-shot directory queries
+  link_pool.py        pooled links + reader threads + pong events
+  pending.py          per-hop reply routing table
+  data_server.py      directory authorities server
+  node.py             relay node + exit role
+  client.py           sender/inbox/reply decryption
+  server.py           plain destination server B
+demo/
+  server.py           directory process
+  node.py             relay process
+  client.py           server B / sender CLI
+  run_all.py          one-command end-to-end demo
+documant.md           full protocol/API/lifecycle documentation
+tests/                unittest suite
+```
+
+## Security limitations
+
+Por demonstrates the shape of an onion network; it is not hardened for real
+anonymity. In particular:
+
+- The directory is a central point of trust and sees registrations and query
+  timing.
+- There is no cover traffic, padding, batching, or timing obfuscation, so
+  traffic analysis is possible.
+- Links are plain TCP; there is no link encryption or forward secrecy.
+- The exit node and destination see the message and the destination address in
+  plaintext, exactly as with Tor exit traffic.
+- A single malicious relay can delay or drop traffic.
+- RSA keys are generated per process and are not persisted.
+
+Use it to learn, not to protect a real identity.
+
+## Author
+
+**7aydara** - GitHub: `@bouchekifaassem`

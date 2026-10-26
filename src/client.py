@@ -1,228 +1,376 @@
 """Por client sender (UML box: ``client``, the sending half).
 
-The destination half of the design (server B) lives alone in
-:mod:`src.server` - this class only *sends*:
-
-* it fetches the network data from the directory authorities
-  (:meth:`get_data_of_network`), calculates a circuit (:meth:`calc_path`)
-  and pushes onion-encrypted messages into it.
-
-There is **no client handshake**.  The circuit's nodes are directory data
-(host, port and every node's public key come from the directory), and the
-client's own public key rides inside each onion layer as ``reply_pub`` -
-that is how replies come back.  Only one socket is opened, to the entry
-(start) node; every other hop is reached by the nodes themselves.
-
-The link is **persistent, chat style**: build the circuit once with
-:meth:`init_connection`, then :meth:`send_message` as often as you like -
-no new connection per message.  A background reader thread owns the entry
-link, so replies arrive whenever they come back: they are matched by
-``msg_id``, stripped of one RSA layer per hop and pushed into an inbox
-that :meth:`wait_reply` drains.  A keepalive pings the entry node every
-``protocol.LINK_PING_EVERY`` seconds; a dead circuit is rebuilt with the
-same node ids on the next send.
+The sender fetches node keys from the directory, builds an onion, and
+uses one persistent TCP link to the entry node.  Replies are matched by
+``msg_id`` and held in a condition-backed inbox; ``wait_reply`` never
+does the old get/put spin.
 """
 
-import json
-import queue
 import random
-import socket
 import threading
 import time
 
-from . import protocol
+from .config import DEFAULT
+from .directory_client import DirectoryClient
+from .errors import CryptoError, ProtocolError
 from .keys import Rsa
+from .link import Link, connect
+from .log import get_logger
+from .wire import (
+    b64,
+    encode_json,
+    fmt_addr,
+    new_id,
+    parse_addr,
+    require_int,
+    require_str,
+    unb64,
+)
 
 
 class Client:
-    def __init__(self, dir_host: str = "127.0.0.1", dir_port: int = 9000,
-                 keysize: int = 2048):
+    def __init__(
+        self,
+        dir_host: str = "127.0.0.1",
+        dir_port: int = 9000,
+        keysize: int = None,
+        *,
+        settings=DEFAULT,
+    ):
+        self.settings = settings
         self.dir_addr = (dir_host, dir_port)
-        self.rsa = Rsa(keysize)
-        self.node_path = []        # ordered [{"id", "host", "port", ...}]
-        self.rsa_of_nodes = {}     # node id -> public key
-        self._entry_link = None    # the one live link: us -> entry node
-        self._path_ids = None      # circuit node ids, kept for rebuilds
-        self._hops = 2             # circuit size, kept for rebuilds
-        self._inbox = queue.Queue()  # (msg_id, text) replies, chat style
-        self._layers = {}          # msg_id -> layers to strip on the way back
-        self._bad_nodes = set()    # nodes a rebuild should avoid for now
+        self._dir = DirectoryClient(dir_host, dir_port, settings)
+        self.rsa = Rsa(settings.key_size if keysize is None else keysize)
+        self._reply_pub = self.rsa.export_public()
+
+        self.node_path = []
+        self.rsa_of_nodes = {}
+        self._entry_link = None
+        self._link_lock = threading.Lock()
+        self._path_ids = None
+        self._hops = 2
+        self._bad_nodes = set()
+
+        self._inbox = []
+        self._inbox_cv = threading.Condition()
+        self._layers = {}
+        self._layers_lock = threading.Lock()
+
         self._pong = threading.Event()
         self._running = False
         self._stop = threading.Event()
         self._reader = None
         self._keepalive = None
+        self._log = get_logger("client")
 
     # -- directory ------------------------------------------------------
     def get_data_of_network(self):
-        """Ask the directory authorities server for the network view."""
-        with socket.create_connection(self.dir_addr) as sock:
-            protocol.send_msg(sock, {"type": "get_data_of_network"})
-            reply = protocol.recv_msg(sock)
-        return reply.get("nodes", [])
+        return self._dir.get_network()
 
     def get_client(self, client_id: str):
-        with socket.create_connection(self.dir_addr) as sock:
-            protocol.send_msg(sock, {"type": "get_client", "id": client_id})
-            reply = protocol.recv_msg(sock)
-        return reply.get("client")
+        return self._dir.get_client(client_id)
+
+    def get_clients(self, client_ids) -> dict:
+        return self._dir.get_clients(client_ids)
 
     # -- sender mode ----------------------------------------------------
     def calc_path(self, network, length: int):
-        """Pick ``length`` random nodes (the ``calc path`` loop in the diagram).
+        """Pick ``length`` random nodes, avoiding recently bad ones."""
+        if isinstance(length, bool) or not isinstance(length, int):
+            raise RuntimeError("path length must be an integer")
+        if not 1 <= length <= self.settings.max_hops:
+            raise RuntimeError(
+                f"path length must be between 1 and {self.settings.max_hops}"
+            )
 
-        Nodes that just failed are avoided; if too few are left, everyone
-        is back in the pool (the directory may list a node for a while
-        after it died, so "reachable" is only known by trying).
-        """
-        good = [entry for entry in network if entry["id"] not in self._bad_nodes]
+        nodes = []
+        seen = set()
+        for entry in network:
+            if not isinstance(entry, dict):
+                continue
+            node_id = entry.get("id")
+            if isinstance(node_id, str) and node_id not in seen:
+                seen.add(node_id)
+                nodes.append(entry)
+
+        good = [
+            entry for entry in nodes
+            if entry["id"] not in self._bad_nodes
+        ]
         if len(good) < length:
             self._bad_nodes.clear()
-            good = network
+            good = nodes
         if length > len(good):
-            raise RuntimeError(f"path of {length} hops requested, "
-                               f"but network only has {len(good)} nodes")
+            raise RuntimeError(
+                f"path of {length} hops requested, "
+                f"but network only has {len(good)} nodes"
+            )
         return random.sample(good, length)
 
-    def _node_key(self, entry) -> "Rsa":
-        """Public key of a node, straight from directory data (no handshake)."""
+    def _node_key(self, entry):
         pem = entry.get("public_key")
-        if not pem:
-            raise RuntimeError(f"node {entry['id']} published no public key "
-                               f"in the directory")
-        return self.rsa.import_public(pem)
+        if not isinstance(pem, str) or not pem:
+            raise RuntimeError(
+                f"node {entry.get('id')} published no public key "
+                f"in the directory"
+            )
+        return Rsa.import_public(pem)
+
+    def _validate_path_entry(self, entry: dict) -> dict:
+        node_id = require_str(
+            entry, "id", max_length=self.settings.max_id_length
+        )
+        host = require_str(
+            entry, "host", max_length=self.settings.max_host_length
+        )
+        port = require_int(entry, "port", min_value=1, max_value=65535)
+        if entry.get("kind", "node") != "node":
+            raise RuntimeError(f"{node_id!r} is not a relay node")
+        if not isinstance(entry.get("public_key"), str):
+            raise RuntimeError(f"node {node_id} has no public key")
+        return {
+            "id": node_id,
+            "host": host,
+            "port": port,
+            "kind": "node",
+            "public_key": entry["public_key"],
+        }
 
     def init_connection(self, hops: int = 2, path=None):
-        """Build the circuit and open the one persistent link: explicit
-        ``path`` of node ids, or ``hops`` random.
-
-        The last node of the circuit is the exit node.  Nothing is
-        negotiated on the wire: every node's address and public key comes
-        from the directory, and the only connection we open is to the
-        entry node - the client's key travels later, inside the onion.
-        The circuit stays up for every later message (chat style).
-        """
+        """Build a circuit and open the one persistent entry link."""
         if path:
-            self.node_path = [self.get_client(node_id) for node_id in path]
-            missing = [node_id for node_id, entry in zip(path, self.node_path)
-                       if entry is None]
+            ids = [str(node_id).strip() for node_id in path]
+            if not ids or any(not node_id for node_id in ids):
+                raise RuntimeError("path must contain non-empty node ids")
+            if len(set(ids)) != len(ids):
+                raise RuntimeError("path contains duplicate node ids")
+            if len(ids) > self.settings.max_hops:
+                raise RuntimeError(
+                    f"path is longer than {self.settings.max_hops} hops"
+                )
+            entries = self._dir.get_clients(ids)
+            missing = [node_id for node_id in ids if node_id not in entries]
             if missing:
-                raise RuntimeError(f"unknown nodes: {', '.join(missing)}")
+                raise RuntimeError(
+                    f"unknown nodes: {', '.join(missing)}"
+                )
+            self.node_path = [
+                self._validate_path_entry(entries[node_id])
+                for node_id in ids
+            ]
+            self._hops = len(self.node_path)
         else:
-            self.node_path = self.calc_path(self.get_data_of_network(), hops)
+            if isinstance(hops, bool) or not isinstance(hops, int):
+                raise RuntimeError("hops must be an integer")
+            if not 1 <= hops <= self.settings.max_hops:
+                raise RuntimeError(
+                    f"hops must be between 1 and {self.settings.max_hops}"
+                )
+            self.node_path = self.calc_path(
+                self.get_data_of_network(), hops
+            )
+            self._hops = hops
 
-        self.rsa_of_nodes = {entry["id"]: self._node_key(entry)
-                             for entry in self.node_path}
+        self.rsa_of_nodes = {
+            entry["id"]: self._node_key(entry)
+            for entry in self.node_path
+        }
         self._path_ids = [entry["id"] for entry in self.node_path]
-        self._hops = hops
 
-        self._drop_entry()  # a re-build replaces the old entry link
+        self._drop_entry()  # a rebuild replaces the old entry link
         entry = self.node_path[0]
-        sock = socket.create_connection((entry["host"], entry["port"]))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        link = protocol.Link(sock)
-        self._entry_link = link
+        sock_link = connect(
+            entry["host"],
+            entry["port"],
+            timeout=self.settings.connect_timeout,
+            max_frame_size=self.settings.max_frame_size,
+        )
+        with self._link_lock:
+            self._entry_link = sock_link
         self._running = True
+        self._stop.clear()
+        self._pong.clear()
 
-        self._reader = threading.Thread(target=self._read_loop, args=(link,),
-                                        daemon=True)
+        self._reader = threading.Thread(
+            target=self._read_loop,
+            args=(sock_link,),
+            daemon=True,
+            name="por-client-reader",
+        )
         self._reader.start()
-        if self._keepalive is None:
-            self._keepalive = threading.Thread(target=self._ping_loop,
-                                               daemon=True)
+        if self._keepalive is None or not self._keepalive.is_alive():
+            self._keepalive = threading.Thread(
+                target=self._ping_loop,
+                daemon=True,
+                name="por-client-keepalive",
+            )
             self._keepalive.start()
         return self.node_path
 
-    def _read_loop(self, link: protocol.Link) -> None:
-        """Own the entry link: replies -> inbox, pongs -> keepalive."""
+    def _read_loop(self, link: Link) -> None:
         try:
             while self._running and self._entry_link is link:
                 msg = link.recv()
-                kind = msg.get("type")
+                kind = msg["type"]
                 if kind == "reply":
                     self._on_reply(msg)
                 elif kind == "pong":
                     self._pong.set()
-        except (ConnectionError, OSError, protocol.ProtocolError, KeyError, ValueError):
+                else:
+                    raise ProtocolError(
+                        f"unexpected message from entry node: {kind!r}"
+                    )
+        except (ConnectionError, OSError, ProtocolError):
             pass
+        except Exception:
+            self._log.exception("reply reader failed")
         finally:
-            if self._entry_link is link:
-                self._entry_link = None  # next send rebuilds the circuit
+            with self._link_lock:
+                if self._entry_link is link:
+                    self._entry_link = None
+            link.close()
 
     def _on_reply(self, msg: dict) -> None:
-        """Strip one RSA layer per hop and hand the text to the inbox."""
-        msg_id = msg.get("msg_id")
-        blob = protocol.unb64(msg.get("payload", ""))
-        for _ in range(self._layers.pop(msg_id, len(self.node_path))):
-            blob = self.rsa.decrypt_message(blob)
-        self._inbox.put((msg_id, blob.decode()))
+        """Strip one layer per hop and hand the text to the inbox."""
+        try:
+            msg_id = require_str(msg, "msg_id", max_length=256)
+            with self._layers_lock:
+                layer_entry = self._layers.pop(msg_id, None)
+            if layer_entry is None:
+                self._log.warning(
+                    "dropping reply for unknown/expired msg %s", msg_id[:8]
+                )
+                return
+            layers, _created = layer_entry
+            blob = unb64(require_str(msg, "payload", allow_empty=True))
+            for _ in range(layers):
+                blob = self.rsa.decrypt_message(blob)
+            text = blob.decode("utf-8")
+        except (ProtocolError, CryptoError, UnicodeDecodeError) as exc:
+            self._log.warning("dropping malformed reply: %s", exc)
+            return
+        self._put_reply(msg_id, text)
+
+    def _build_onion(self, target_addr: str, text: str) -> dict:
+        envelope = {
+            "next": target_addr,
+            "final": True,
+            "reply_pub": self._reply_pub,
+            "payload": b64(text.encode("utf-8")),
+        }
+        for node in reversed(self.node_path):
+            blob = self.rsa.encrypt_for(
+                encode_json(envelope),
+                self.rsa_of_nodes[node["id"]],
+            )
+            envelope = {
+                "next": node["id"],
+                "reply_pub": self._reply_pub,
+                "payload": b64(blob),
+            }
+        return envelope
 
     def send_message(self, text: str, target_addr: str) -> str:
-        """Onion-encrypt ``text`` for ``target_addr`` (the destination server)
-        and push it into the circuit - no new connection, the persistent
-        entry link is reused.  Returns the ``msg_id`` the reply echoes.
-
-        Every layer also carries our public key (``reply_pub``) so each node
-        on the way back can add its own encryption for us.  The reply rides
-        the circuit back, so no address of ours ever leaves this machine.
-        A dead circuit is rebuilt with the same node ids and the message is
-        retried once.
-        """
+        """Onion-encrypt ``text`` and push it through the persistent link."""
         if not self.node_path:
             raise RuntimeError("call init_connection() before send_message()")
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        text_bytes = text.encode("utf-8")
+        if len(text_bytes) > self.settings.max_text_bytes:
+            raise ValueError(
+                f"message is larger than {self.settings.max_text_bytes} bytes"
+            )
+        target_host, target_port = parse_addr(target_addr)
+        target = fmt_addr(target_host, target_port)
+        self._prune_layers()
 
-        reply_pub = self.rsa.export_public()
-        msg_id = protocol.new_id()
-        for attempt in (1, 2):
-            if self._entry_link is None:
-                self._ensure_link()
-            envelope = {"next": target_addr, "final": True, "reply_pub": reply_pub,
-                        "payload": protocol.b64(text.encode())}
+        msg_id = new_id()
+        with self._layers_lock:
+            while msg_id in self._layers:  # pragma: no cover
+                msg_id = new_id()
 
-            # wrap one RSA layer per hop, exit first (encdata1L, then encdat2L, ...)
-            for node in reversed(self.node_path):
-                blob = self.rsa.encrypt_for(json.dumps(envelope).encode(),
-                                            self.rsa_of_nodes[node["id"]])
-                envelope = {"next": node["id"], "reply_pub": reply_pub,
-                            "payload": protocol.b64(blob)}
+        try:
+            for attempt in (1, 2):
+                if self._entry_link is None:
+                    self._ensure_link()
 
-            self._layers[msg_id] = len(self.node_path)
-            try:
-                self._entry_link.send({"type": "forward", "from": "client",
-                                       "msg_id": msg_id,
-                                       "payload": envelope["payload"]})
-                return msg_id
-            except (ConnectionError, OSError):
-                if self.node_path:  # the entry link died mid-chat
-                    self._bad_nodes.add(self.node_path[0]["id"])
-                self._drop_entry()
-                if attempt == 2:
-                    raise
+                envelope = self._build_onion(target, text)
+                with self._layers_lock:
+                    self._layers[msg_id] = (
+                        len(self.node_path),
+                        time.monotonic(),
+                    )
+
+                with self._link_lock:
+                    link = self._entry_link
+                if link is None:
+                    if attempt == 2:
+                        raise ConnectionError("entry link is not available")
+                    continue
+                try:
+                    link.send({
+                        "type": "forward",
+                        "from": "client",
+                        "msg_id": msg_id,
+                        "payload": envelope["payload"],
+                    })
+                    return msg_id
+                except (ConnectionError, OSError):
+                    if self.node_path:
+                        self._bad_nodes.add(self.node_path[0]["id"])
+                    self._drop_entry()
+                    if attempt == 2:
+                        raise
+        except BaseException:
+            with self._layers_lock:
+                self._layers.pop(msg_id, None)
+            raise
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     def wait_reply(self, timeout: float = 15.0, msg_id: str = None) -> str:
-        """Pop the next reply off the inbox (chat style, non-blocking link).
-
-        Replies arrive on the reader thread whenever they come back, so
-        this only waits for one to show up - optionally a specific one.
-        """
+        """Wait for a reply, optionally for one specific ``msg_id``."""
         if not self.node_path:
             raise RuntimeError("call init_connection() before wait_reply()")
-        deadline = None if timeout is None else time.time() + timeout
-        while True:
-            left = None if deadline is None else deadline - time.time()
-            if left is not None and left <= 0:
-                raise TimeoutError(f"no reply from the circuit"
-                                   + (f" for {msg_id}" if msg_id else ""))
-            got_id, text = self._inbox.get(timeout=left)
-            if msg_id is None or got_id == msg_id:
-                return text
-            # not the one we asked for - park it for the next wait_reply
-            self._inbox.put((got_id, text))
+        deadline = (
+            None if timeout is None
+            else time.monotonic() + max(0.0, timeout)
+        )
+        with self._inbox_cv:
+            while True:
+                for index, (got_id, text) in enumerate(self._inbox):
+                    if msg_id is None or got_id == msg_id:
+                        del self._inbox[index]
+                        self._prune_layers()
+                        return text
+                if deadline is None:
+                    wait_for = None
+                else:
+                    wait_for = deadline - time.monotonic()
+                    if wait_for <= 0:
+                        self._prune_layers()
+                        raise TimeoutError(
+                            "no reply from the circuit"
+                            + (f" for {msg_id}" if msg_id else "")
+                        )
+                self._inbox_cv.wait(wait_for)
+
+    def _put_reply(self, msg_id: str, text: str) -> None:
+        with self._inbox_cv:
+            self._inbox.append((msg_id, text))
+            self._inbox_cv.notify_all()
+
+    def _prune_layers(self) -> None:
+        now = time.monotonic()
+        with self._layers_lock:
+            for msg_id, (_layers, created) in list(self._layers.items()):
+                if now - created > self.settings.layers_ttl:
+                    del self._layers[msg_id]
 
     # -- keepalive ------------------------------------------------------
     def ping(self) -> bool:
-        """Ping the entry node over the persistent link."""
-        link = self._entry_link
+        with self._link_lock:
+            link = self._entry_link
         if link is None:
             return False
         self._pong.clear()
@@ -231,36 +379,39 @@ class Client:
         except (ConnectionError, OSError):
             self._drop_entry()
             return False
-        if not self._pong.wait(protocol.LINK_PING_TIMEOUT):
+        if not self._pong.wait(self.settings.link_ping_timeout):
             self._drop_entry()
             return False
         return True
 
     def _ping_loop(self) -> None:
-        """Ping the entry node every LINK_PING_EVERY seconds (chat keepalive)."""
         while self._running:
-            if self._stop.wait(protocol.LINK_PING_EVERY):
+            if self._stop.wait(self.settings.link_ping_every):
                 break
             if self._entry_link is not None and not self.ping():
-                print("[sender] entry node went quiet - circuit dropped, "
-                      "next send rebuilds it", flush=True)
+                self._log.warning(
+                    "entry node went quiet - circuit dropped, "
+                    "next send rebuilds it"
+                )
+            self._prune_layers()
 
     def _ensure_link(self) -> None:
-        """Re-open the circuit: same node ids first, random if they are gone."""
+        """Re-open the circuit: same ids first, random if they are gone."""
         if self._path_ids:
             try:
                 self.init_connection(hops=self._hops, path=self._path_ids)
                 return
-            except (RuntimeError, ConnectionError, OSError):
-                # init_connection only ever dials the entry, so the entry
-                # is the one that just refused us
-                self._bad_nodes.add(self._path_ids[0])
-                print("[sender] old circuit is gone, picking a fresh one",
-                      flush=True)
+            except (RuntimeError, ConnectionError, OSError, ProtocolError) as exc:
+                if self._path_ids:
+                    self._bad_nodes.add(self._path_ids[0])
+                self._log.warning(
+                    "old circuit is gone (%s), picking a fresh one", exc
+                )
         self.init_connection(hops=self._hops)
 
     def _drop_entry(self) -> None:
-        link, self._entry_link = self._entry_link, None
+        with self._link_lock:
+            link, self._entry_link = self._entry_link, None
         if link is not None:
             link.close()
 
@@ -269,3 +420,14 @@ class Client:
         self._running = False
         self._stop.set()
         self._drop_entry()
+        for thread in (self._reader, self._keepalive):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=self.settings.stop_join_timeout)
+        with self._layers_lock:
+            self._layers.clear()
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
