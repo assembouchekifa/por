@@ -256,6 +256,10 @@ class Node(ServiceBase):
         if not isinstance(final, bool):
             raise ProtocolError("'final' must be a boolean")
 
+        chat = inner.get("chat", False)
+        if not isinstance(chat, bool):
+            raise ProtocolError("'chat' must be a boolean")
+
         if final:
             destination = require_str(
                 inner,
@@ -270,7 +274,13 @@ class Node(ServiceBase):
             inner_payload = require_str(inner, "payload")
 
         hop_id = new_id()
-        self._pending.remember(hop_id, back_link, reply_key, return_id)
+        self._pending.remember(
+            hop_id,
+            back_link,
+            reply_key,
+            return_id,
+            chat=chat,
+        )
 
         if final:
             self._log.info(
@@ -446,6 +456,8 @@ class Node(ServiceBase):
             "from": self.node_id,
             "text": text,
         }
+        if envelope.get("chat"):
+            deliver["chat"] = True
         last_error = None
         for attempt in (1, 2):
             link = None
@@ -477,7 +489,7 @@ class Node(ServiceBase):
     def _return_reply(self, msg: dict) -> None:
         msg_id = require_str(msg, "msg_id", max_length=256)
         payload_b64 = require_str(msg, "payload", allow_empty=True)
-        pending = self._pending.pop(msg_id)
+        pending = self._pending.claim(msg_id)
         if pending is None:
             return  # link died, reply too late, or duplicate
         blob = unb64(payload_b64)

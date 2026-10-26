@@ -114,6 +114,60 @@ class FullCircuitTests(unittest.TestCase):
             )
             self.assertIs(self.client._entry_link, entry_link)
 
+    def test_chat_server_sends_multiple_replies_on_one_route(self):
+        def handler(session, text):
+            session.send(f"first:{text}")
+            session.send(f"second:{text}")
+
+        chat_server = Server("127.0.0.1", 0, settings=self.settings)
+        chat_server.listen()
+        chat_server.serve_chat(handler, background=True)
+        self.addCleanup(chat_server.close)
+        address = "%s:%s" % chat_server.local_addr
+
+        self.client.send_message("hello", address, chat=True)
+        replies = [self.client.receive(timeout=5.0) for _ in range(2)]
+        self.assertEqual(
+            [text for _msg_id, text in replies],
+            ["first:hello", "second:hello"],
+        )
+
+        # The same route must still work for a later chat turn.
+        self.client.send_message("again", address, chat=True)
+        replies = [self.client.receive(timeout=5.0) for _ in range(2)]
+        self.assertEqual(
+            [text for _msg_id, text in replies],
+            ["first:again", "second:again"],
+        )
+
+    def test_chat_server_can_send_after_handler_returns(self):
+        sessions = []
+
+        def on_open(session):
+            sessions.append(session)
+
+        def handler(session, text):
+            return None
+
+        chat_server = Server("127.0.0.1", 0, settings=self.settings)
+        chat_server.listen()
+        chat_server.serve_chat(
+            handler,
+            on_open=on_open,
+            background=True,
+        )
+        self.addCleanup(chat_server.close)
+        address = "%s:%s" % chat_server.local_addr
+
+        self.client.send_message("open", address, chat=True)
+        wait_until(
+            lambda: bool(sessions) and sessions[0].ready,
+            message="chat session did not become ready",
+        )
+        sessions[0].send("delayed reply")
+        _msg_id, text = self.client.receive(timeout=5.0)
+        self.assertEqual(text, "delayed reply")
+
     def test_unreachable_destination_times_out_then_circuit_still_works(self):
         address = f"{self.server_addr[0]}:{self.server_addr[1]}"
         dead = f"127.0.0.1:{free_port()}"

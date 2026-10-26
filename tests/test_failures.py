@@ -85,6 +85,25 @@ class FailureTests(unittest.TestCase):
         finally:
             link.close()
 
+    def test_chat_pending_entry_survives_repeated_replies(self):
+        table = PendingTable(ttl=60.0, max_entries=4)
+        link = Link(socket.socket())
+        try:
+            table.remember("chat", link, None, "return-chat", chat=True)
+            first = table.claim("chat")
+            second = table.claim("chat")
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertGreaterEqual(second.created, first.created)
+            self.assertEqual(len(table), 1)
+
+            table.remember("one-shot", link, None, "return-one")
+            self.assertIsNotNone(table.claim("one-shot"))
+            self.assertIsNone(table.claim("one-shot"))
+            self.assertEqual(len(table), 1)
+        finally:
+            link.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,9 +54,29 @@ class ClientInboxTests(unittest.TestCase):
 
     def test_layer_entries_are_pruned(self):
         self.client.settings = Settings(key_size=1024, layers_ttl=0)
-        self.client._layers["old"] = (2, time.monotonic() - 1)
+        self.client._layers["old"] = (2, time.monotonic() - 1, False)
         self.client._prune_layers()
         self.assertNotIn("old", self.client._layers)
+
+    def test_receive_returns_any_buffered_reply(self):
+        self.client._put_reply("one", "first")
+        self.client._put_reply("two", "second")
+        self.assertEqual(self.client.receive(timeout=0), ("one", "first"))
+        self.assertEqual(self.client.receive(timeout=0), ("two", "second"))
+
+    def test_chat_layer_survives_multiple_replies(self):
+        now = time.monotonic()
+        self.client._layers["chat"] = (1, now, True)
+        with mock.patch.object(
+            self.client.rsa,
+            "decrypt_message",
+            side_effect=[b"first", b"second"],
+        ):
+            self.client._on_reply({"msg_id": "chat", "payload": ""})
+            self.client._on_reply({"msg_id": "chat", "payload": ""})
+        self.assertIn("chat", self.client._layers)
+        self.assertEqual(self.client.receive(timeout=0), ("chat", "first"))
+        self.assertEqual(self.client.receive(timeout=0), ("chat", "second"))
 
 
 class ClientCircuitTests(unittest.TestCase):

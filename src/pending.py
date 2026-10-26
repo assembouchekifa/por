@@ -2,12 +2,14 @@
 
 A node remembers ``hop_id -> (incoming link, sender public key, return id)``
 for every forwarded message.  Replies come back on the pooled link and
-are matched by ``hop_id``.  The table has a TTL and a hard size cap.
+are matched by ``hop_id``.  Normal entries are consumed by the first reply;
+chat entries are leased and refreshed until the TTL expires.  The table has
+a TTL and a hard size cap.
 """
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import DEFAULT
 from .errors import ProtocolError
@@ -20,6 +22,7 @@ class PendingEntry:
     reply_key: object
     return_id: str
     created: float
+    chat: bool = False
 
 
 class PendingTable:
@@ -36,6 +39,8 @@ class PendingTable:
         back_link: Link,
         reply_key,
         return_id: str,
+        *,
+        chat: bool = False,
     ) -> None:
         now = time.monotonic()
         with self._lock:
@@ -48,7 +53,25 @@ class PendingTable:
                 reply_key=reply_key,
                 return_id=return_id,
                 created=now,
+                chat=chat,
             )
+
+    def get(self, hop_id: str):
+        """Look up a route without consuming it."""
+        with self._lock:
+            return self._entries.get(hop_id)
+
+    def claim(self, hop_id: str):
+        """Consume a one-shot route or lease a reusable chat route."""
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(hop_id)
+            if entry is None:
+                return None
+            if entry.chat:
+                self._entries[hop_id] = replace(entry, created=now)
+                return entry
+            return self._entries.pop(hop_id)
 
     def pop(self, hop_id: str):
         with self._lock:

@@ -67,6 +67,10 @@ server B reply -> node2 -> node3 -> node1 -> client A
 Each relay adds one encryption layer on the way back; only client A can remove
 all layers.
 
+In the chat demo, both sides can type. The destination server can send multiple
+replies over one leased route, while the client can send more messages over the
+same circuit. The reply encryption is unchanged.
+
 ---
 
 ## 3. Project layout
@@ -92,7 +96,8 @@ demo/
   config.py           demo topology/defaults
   server.py           directory process
   node.py             relay process
-  client.py           server B / sender CLI
+  client.py           server B / sender / chat CLI
+  network.py          start directory + relay nodes and keep them running
   run_all.py          one-command end-to-end demo
 tests/
   test_wire.py
@@ -223,6 +228,10 @@ reverse path order. Each wrapped layer contains:
 }
 ```
 
+A chat message adds `"chat": true` to the final envelope and to every wrapper.
+Relays use that flag to lease the reply route for more than one reply instead
+of consuming it after the first one.
+
 The outer layer's `next` is the entry node. A relay peels exactly one layer and
 then either:
 
@@ -258,9 +267,12 @@ The exit node opens a connection to the destination server and sends:
   "type": "deliver",
   "msg_id": "<exit per-hop id>",
   "from": "<exit node id>",
-  "text": "<plaintext>"
+  "text": "<plaintext>",
+  "chat": true
 }
 ```
+
+`chat` is present only for a chat delivery; normal messages omit it.
 
 Server B answers on the same link:
 
@@ -325,26 +337,62 @@ Hardware and Python version affect these numbers.
 Reply processing is symmetric with the forward path:
 
 1. Server B sends a reply to the exit node on the link the exit opened.
-2. The exit node pops its pending entry for that `hop_id`.
+2. The exit node claims its pending entry for that `hop_id`.
 3. The exit adds one encryption layer using the client's `reply_pub`.
 4. It sends `{"type": "reply", "msg_id": previous_id, "payload": ...}` over the
    incoming link.
-5. Every relay repeats: pop pending, add one layer, send backwards.
+5. Every relay repeats: claim pending, add one layer, send backwards.
 6. The entry node sends the final layer to client A using the client's original
    `msg_id`.
-7. Client A pops the layer count, decrypts once per hop, and puts the text in
-   its inbox.
+7. Client A decrypts once per hop and puts the text in its inbox.
+
+For a normal message, claiming a pending entry **consumes** it. The first
+reply wins; a duplicate or late reply for the same id is dropped. The client
+also consumes its layer bookkeeping after the first reply.
+
+For a chat message (`"chat": true`), claiming the entry **leases** it:
+`PendingTable.claim()` refreshes the entry's timestamp and leaves it in the
+table. The destination can therefore send many replies using the same exit
+`msg_id`, and every relay encrypts and forwards each one. The client keeps its
+layer entry until the chat route expires.
+
+`src/server.py` exposes this through `ServerSession` and `Server.serve_chat()`:
+
+- `serve_chat(handler, on_open=None)` accepts exit links and calls
+  `handler(session, text)` for each delivery.
+- `ServerSession` stores the latest `msg_id` seen on that link internally.
+- `ServerSession.send(text)` sends a reply on that latest route.
+- `on_open(session)` runs once per accepted link so a chat demo can start a
+  stdin reader thread.
+- The old `Server.serve(handler)` and `handler(text) -> one reply` API is
+  unchanged.
 
 The pending table:
 
-- expires entries after `pending_ttl`
+- expires one-shot entries after `pending_ttl`
+- refreshes a chat entry on every reply
 - has a hard `max_pending` cap
 - is cleaned when an incoming link closes
 - is cleared on shutdown
 
-Client layer bookkeeping is similarly pruned after `layers_ttl`, on send, on
-reply, and when waiting times out. A reply for an unknown or expired id is
-dropped instead of crashing the reader.
+Client layer bookkeeping is pruned after `layers_ttl`, on send, on reply, and
+when waiting times out. A reply for an unknown or expired id is dropped instead
+of crashing the reader.
+
+### Chat limits
+
+The minimal chat implementation has no per-conversation session id. It assumes
+one chat client per exit-to-destination link. This matters because the exit
+pools one destination link per `host:port`; two clients using the same exit and
+destination could otherwise share the server-side "latest route." Clients using
+different exits get separate destination links.
+
+If the whole chat is idle for longer than `pending_ttl` (300 seconds by
+default), the route expires. The next client line creates a fresh route. While
+messages are flowing, each reply refreshes the route.
+
+All reply layers still use RSA-OAEP + AES-256-GCM. Chat does not weaken or
+change the encryption format.
 
 ---
 
@@ -393,6 +441,16 @@ in `recv()` is woken reliably.
 
 Default timeout is 15 seconds. Pass `msg_id=` to wait for a specific send.
 
+`Client.receive(timeout=None)` is the continuous version used by chat:
+
+- returns `(msg_id, text)` for any reply
+- blocks until a reply arrives, or raises `TimeoutError`
+- leaves the inbox available to other callers
+- does not consume a chat route after one reply
+
+The chat demo runs `receive()` in a reader thread while the main thread reads
+stdin and calls `send_message(..., chat=True)`.
+
 ---
 
 ## 10. Client API
@@ -413,6 +471,10 @@ client.init_connection(path=["node1", "node3", "node2"])
 msg_id = client.send_message("hello", "127.0.0.1:8000")
 reply = client.wait_reply(timeout=15, msg_id=msg_id)
 
+# Chat: keep the reply route open and receive several replies.
+client.send_message("hello again", "127.0.0.1:8000", chat=True)
+msg_id, text = client.receive(timeout=15)
+
 client.close()
 ```
 
@@ -425,12 +487,14 @@ Useful public methods:
 | `get_clients(ids)` | Batch lookup |
 | `calc_path(network, length)` | Pick a random path |
 | `init_connection(hops=2, path=None)` | Build a circuit and open the entry link |
-| `send_message(text, target_addr)` | Build an onion and send it |
-| `wait_reply(timeout=15, msg_id=None)` | Wait for a reply |
+| `send_message(text, target_addr, chat=False)` | Build an onion and send it |
+| `wait_reply(timeout=15, msg_id=None)` | Wait for one reply |
+| `receive(timeout=None)` | Wait for any reply, returning `(msg_id, text)` |
 | `ping()` | Ping the entry link |
 | `close()` | Close the circuit and background threads |
 
-`target_addr` must be `"host:port"`.
+`target_addr` must be `"host:port"`. Use `chat=True` when the destination
+should be able to send more than one reply on the same route.
 
 ---
 
@@ -447,6 +511,29 @@ Pick a circuit:
 ```bash
 .venv/bin/python demo/run_all.py --via node2,node1
 ```
+
+Interactive netcat-style chat:
+
+```bash
+# terminal 1: directory + relay nodes
+.venv/bin/python demo/network.py
+
+# terminal 2: server B
+.venv/bin/python demo/client.py --server --chat --port 8000
+
+# terminal 3: client A
+.venv/bin/python demo/client.py --chat \
+    --to 127.0.0.1:8000 --via node1,node3,node2
+```
+
+Type a line and press Enter in either terminal. Client A's first line creates
+the reply route; server input typed before that is only sent after the route is
+ready. Ctrl-D or Ctrl-C exits.
+
+Every chat line uses `send_message(..., chat=True)`. Each line creates a fresh
+reply route and updates Server B's latest route id; older routes remain valid
+until their TTL expires. Server B's stdin reader uses `ServerSession.send()`,
+so it can send many replies on the latest route.
 
 Manual processes:
 
@@ -492,9 +579,11 @@ The suite covers:
 - directory registration, heartbeat, batch lookup, stale cleanup
 - directory restart and automatic re-registration
 - full client → relay → exit → destination → reply circuit
+- multiple server replies on one leased chat route
+- delayed server reply after the handler returns
 - unreachable destinations
 - malformed peers and delivery failures
-- pending-table TTL and link cleanup
+- pending-table TTL, chat-route leasing, and link cleanup
 
 Optional static check if `pyflakes` is installed:
 
@@ -516,6 +605,10 @@ anonymity.
 - The exit node and destination see the message and destination address in
   plaintext.
 - A single malicious relay can delay, drop, or observe traffic it handles.
+- A chat reply route can be reused by its destination until the chat TTL
+  expires; a malicious destination can send repeated replies on it.
+- Minimal chat mode has no session id and assumes one chat client per
+  exit-to-destination link, because the exit pools one link per destination.
 - RSA keys are generated per process and are not persisted.
 - There is no directory authentication or consensus.
 - There is no protection against a global traffic observer.
@@ -556,6 +649,24 @@ If the entry link is down, the next send rebuilds the circuit. Replies that
 arrive after a `wait_reply()` timeout are still accepted until the layer TTL
 expires, so a second `wait_reply()` can consume them.
 
+### Chat messages are not arriving
+
+Check that:
+
+- client A is using `--chat`, so its first line creates a leased route
+- the route has not been idle longer than `pending_ttl` (300 seconds)
+- server B is using `--server --chat`, not a fixed-reply handler
+- only one client is using the same exit-to-destination link in minimal mode
+
+If the route expired, send a new line from client A; that creates a fresh route
+and updates the server's latest route id.
+
+### Raw `nc` does not work
+
+Por does not send plain lines. Every message is a 4-byte big-endian length
+followed by a UTF-8 JSON object. Use `demo/client.py` for the netcat-like
+interface.
+
 ### Port already in use
 
 The demo uses ports `9000` (directory), `7001`–`7003` (nodes), and `8000`
@@ -577,7 +688,7 @@ The library installs a `NullHandler` by default. Demo scripts call
 | `src.client` | `Client` |
 | `src.node` | `Node` |
 | `src.data_server` | `DataServer` |
-| `src.server` | `Server` |
+| `src.server` | `Server`, `ServerSession` |
 | `src.keys` | `Rsa` |
 | `src.protocol` | framing helpers, `test_key`, `prove_key`, protocol constants |
 | `src.config` | `Settings`, `DEFAULT` |

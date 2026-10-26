@@ -3,7 +3,9 @@
 The sender fetches node keys from the directory, builds an onion, and
 uses one persistent TCP link to the entry node.  Replies are matched by
 ``msg_id`` and held in a condition-backed inbox; ``wait_reply`` never
-does the old get/put spin.
+does the old get/put spin.  ``receive`` is the continuous variant used by
+chat, and ``send_message(..., chat=True)`` leases the reply route so the
+destination can send more than one reply.
 """
 
 import random
@@ -235,13 +237,24 @@ class Client:
         try:
             msg_id = require_str(msg, "msg_id", max_length=256)
             with self._layers_lock:
-                layer_entry = self._layers.pop(msg_id, None)
-            if layer_entry is None:
-                self._log.warning(
-                    "dropping reply for unknown/expired msg %s", msg_id[:8]
-                )
-                return
-            layers, _created = layer_entry
+                layer_entry = self._layers.get(msg_id)
+                if layer_entry is None:
+                    self._log.warning(
+                        "dropping reply for unknown/expired msg %s",
+                        msg_id[:8],
+                    )
+                    return
+                layers, _created, chat = layer_entry
+                if chat:
+                    # A chat route may return many replies.  Refresh its
+                    # idle timestamp instead of consuming the route.
+                    self._layers[msg_id] = (
+                        layers,
+                        time.monotonic(),
+                        True,
+                    )
+                else:
+                    del self._layers[msg_id]
             blob = unb64(require_str(msg, "payload", allow_empty=True))
             for _ in range(layers):
                 blob = self.rsa.decrypt_message(blob)
@@ -251,13 +264,21 @@ class Client:
             return
         self._put_reply(msg_id, text)
 
-    def _build_onion(self, target_addr: str, text: str) -> dict:
+    def _build_onion(
+        self,
+        target_addr: str,
+        text: str,
+        *,
+        chat: bool = False,
+    ) -> dict:
         envelope = {
             "next": target_addr,
             "final": True,
             "reply_pub": self._reply_pub,
             "payload": b64(text.encode("utf-8")),
         }
+        if chat:
+            envelope["chat"] = True
         for node in reversed(self.node_path):
             blob = self.rsa.encrypt_for(
                 encode_json(envelope),
@@ -268,14 +289,29 @@ class Client:
                 "reply_pub": self._reply_pub,
                 "payload": b64(blob),
             }
+            if chat:
+                envelope["chat"] = True
         return envelope
 
-    def send_message(self, text: str, target_addr: str) -> str:
-        """Onion-encrypt ``text`` and push it through the persistent link."""
+    def send_message(
+        self,
+        text: str,
+        target_addr: str,
+        *,
+        chat: bool = False,
+    ) -> str:
+        """Onion-encrypt ``text`` and push it through the persistent link.
+
+        Pass ``chat=True`` to keep its reply route open so the destination
+        can send more than one reply.  Every relay then uses the reusable
+        reply route until the pending/layer TTL expires.
+        """
         if not self.node_path:
             raise RuntimeError("call init_connection() before send_message()")
         if not isinstance(text, str):
             raise TypeError("text must be a string")
+        if not isinstance(chat, bool):
+            raise TypeError("chat must be a boolean")
         text_bytes = text.encode("utf-8")
         if len(text_bytes) > self.settings.max_text_bytes:
             raise ValueError(
@@ -295,11 +331,12 @@ class Client:
                 if self._entry_link is None:
                     self._ensure_link()
 
-                envelope = self._build_onion(target, text)
+                envelope = self._build_onion(target, text, chat=chat)
                 with self._layers_lock:
                     self._layers[msg_id] = (
                         len(self.node_path),
                         time.monotonic(),
+                        chat,
                     )
 
                 with self._link_lock:
@@ -355,6 +392,32 @@ class Client:
                         )
                 self._inbox_cv.wait(wait_for)
 
+    def receive(self, timeout: float = None) -> tuple:
+        """Wait for and return any ``(msg_id, text)`` reply.
+
+        This is the continuous counterpart to :meth:`wait_reply`; chat
+        clients use it from a reader thread while the main thread sends.
+        """
+        if not self.node_path:
+            raise RuntimeError("call init_connection() before receive()")
+        deadline = (
+            None if timeout is None
+            else time.monotonic() + max(0.0, timeout)
+        )
+        with self._inbox_cv:
+            while not self._inbox:
+                if deadline is None:
+                    wait_for = None
+                else:
+                    wait_for = deadline - time.monotonic()
+                    if wait_for <= 0:
+                        self._prune_layers()
+                        raise TimeoutError("no reply from the circuit")
+                self._inbox_cv.wait(wait_for)
+            msg_id, text = self._inbox.pop(0)
+        self._prune_layers()
+        return msg_id, text
+
     def _put_reply(self, msg_id: str, text: str) -> None:
         with self._inbox_cv:
             self._inbox.append((msg_id, text))
@@ -363,8 +426,8 @@ class Client:
     def _prune_layers(self) -> None:
         now = time.monotonic()
         with self._layers_lock:
-            for msg_id, (_layers, created) in list(self._layers.items()):
-                if now - created > self.settings.layers_ttl:
+            for msg_id, entry in list(self._layers.items()):
+                if now - entry[1] > self.settings.layers_ttl:
                     del self._layers[msg_id]
 
     # -- keepalive ------------------------------------------------------

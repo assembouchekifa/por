@@ -8,7 +8,7 @@ from .data_server import DataServer
 from .errors import CryptoError, PorError, ProtocolError
 from .keys import Rsa
 from .node import Node
-from .server import Server
+from .server import Server, ServerSession
 
 __all__ = [
     "__version__",
@@ -21,5 +21,6 @@ __all__ = [
     "ProtocolError",
     "Rsa",
     "Server",
+    "ServerSession",
     "Settings",
 ]
